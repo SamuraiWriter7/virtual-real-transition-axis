@@ -1,0 +1,77 @@
+name: Validate Virtual-Real Transition Axis
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.12"
+          - "3.13"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Display Python version
+        run: python --version
+
+      - name: Check Python syntax
+        run: |
+          python -m py_compile axis.py tests/test_axis.py
+
+      - name: Run deterministic simulation
+        run: |
+          python axis.py
+
+      - name: Run unit tests
+        run: |
+          python -m unittest discover -s tests -v
+
+      - name: Validate simulation output
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python axis.py > simulation-output.txt
+
+          grep -Fxq "virtual event 4: backpressure" simulation-output.txt
+          grep -Fxq "mode: degraded" simulation-output.txt
+          grep -Fxq "neutral: zero_neutral" simulation-output.txt
+          grep -Fxq "recovery check 1: False" simulation-output.txt
+          grep -Fxq "recovery check 2 + approval: True" simulation-output.txt
+          grep -Fxq "audit chain valid: True" simulation-output.txt
+          grep -Fxq "records: 11" simulation-output.txt
+
+          echo "Simulation output validation passed."
+
+      - name: Validation summary
+        if: success()
+        run: |
+          echo "======================================"
+          echo "Virtual-Real Transition Axis v0.1"
+          echo "======================================"
+          echo "Python syntax: PASS"
+          echo "Simulation: PASS"
+          echo "Unit tests: PASS"
+          echo "Simulation output: PASS"
+          echo "======================================"
