@@ -10,10 +10,16 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: vrta-validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   validate:
-    name: Validate (Python ${{ matrix.python-version }})
+    name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+
+    timeout-minutes: 10
 
     strategy:
       fail-fast: false
@@ -24,8 +30,16 @@ jobs:
           - "3.13"
 
     steps:
+      # --------------------------------------------------
+      # 1. Checkout
+      # --------------------------------------------------
+
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      # --------------------------------------------------
+      # 2. Python environment
+      # --------------------------------------------------
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -33,45 +47,208 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Display Python version
-        run: python --version
-
-      - name: Check Python syntax
         run: |
-          python -m py_compile axis.py tests/test_axis.py
+          python --version
 
-      - name: Run deterministic simulation
+      # --------------------------------------------------
+      # 3. Syntax validation
+      # --------------------------------------------------
+
+      - name: Validate Python syntax
+        run: |
+          python -m py_compile \
+            axis.py \
+            evidence.py \
+            five_elements.py \
+            tests/test_axis.py \
+            tests/test_evidence.py \
+            tests/test_five_elements.py
+
+      # --------------------------------------------------
+      # 4. Legacy v0.1 simulation
+      # --------------------------------------------------
+
+      - name: Run legacy simulation
         run: |
           python axis.py
 
-      - name: Run unit tests
-        run: |
-          python -m unittest discover -s tests -v
+      # --------------------------------------------------
+      # 5. Validate simulation output
+      # --------------------------------------------------
 
-      - name: Validate simulation output
+      - name: Validate legacy simulation output
         shell: bash
         run: |
           set -euo pipefail
 
           python axis.py > simulation-output.txt
 
-          grep -Fxq "virtual event 4: backpressure" simulation-output.txt
-          grep -Fxq "mode: degraded" simulation-output.txt
-          grep -Fxq "neutral: zero_neutral" simulation-output.txt
-          grep -Fxq "recovery check 1: False" simulation-output.txt
-          grep -Fxq "recovery check 2 + approval: True" simulation-output.txt
-          grep -Fxq "audit chain valid: True" simulation-output.txt
-          grep -Fxq "records: 11" simulation-output.txt
+          grep -Fxq \
+            "virtual event 1: accepted" \
+            simulation-output.txt
 
-          echo "Simulation output validation passed."
+          grep -Fxq \
+            "virtual event 2: accepted" \
+            simulation-output.txt
+
+          grep -Fxq \
+            "virtual event 3: accepted" \
+            simulation-output.txt
+
+          grep -Fxq \
+            "virtual event 4: backpressure" \
+            simulation-output.txt
+
+          grep -Fxq \
+            "mode: degraded" \
+            simulation-output.txt
+
+          grep -Fxq \
+            "real verified analysis: True" \
+            simulation-output.txt
+
+          grep -Fxq \
+            "neutral: zero_neutral" \
+            simulation-output.txt
+
+          grep -Fxq \
+            "recovery check 1: False" \
+            simulation-output.txt
+
+          grep -Fxq \
+            "recovery check 2 + approval: True" \
+            simulation-output.txt
+
+          grep -Fxq \
+            "mode: normal" \
+            simulation-output.txt
+
+          grep -Fxq \
+            "audit chain valid: True" \
+            simulation-output.txt
+
+          grep -Fxq \
+            "records: 11" \
+            simulation-output.txt
+
+          echo "Legacy simulation validation: PASS"
+
+      # --------------------------------------------------
+      # 6. v0.1 regression tests
+      # --------------------------------------------------
+
+      - name: Run v0.1 regression tests
+        run: |
+          python -m unittest discover \
+            -s tests \
+            -p "test_axis.py" \
+            -v
+
+      # --------------------------------------------------
+      # 7. v0.2 evidence tests
+      # --------------------------------------------------
+
+      - name: Run evidence verification tests
+        run: |
+          python -m unittest discover \
+            -s tests \
+            -p "test_evidence.py" \
+            -v
+
+      # --------------------------------------------------
+      # 8. v0.2 five-element tests
+      # --------------------------------------------------
+
+      - name: Run five-element authority tests
+        run: |
+          python -m unittest discover \
+            -s tests \
+            -p "test_five_elements.py" \
+            -v
+
+      # --------------------------------------------------
+      # 9. Complete suite and test-count assertion
+      # --------------------------------------------------
+
+      - name: Run complete 70-test suite
+        run: |
+          python - <<'PY'
+          import sys
+          import unittest
+
+          loader = unittest.TestLoader()
+          suite = loader.discover(
+              start_dir="tests",
+              pattern="test_*.py",
+          )
+
+          expected = 70
+          discovered = suite.countTestCases()
+
+          print(
+              f"Discovered tests: {discovered}",
+              flush=True,
+          )
+
+          if discovered != expected:
+              print(
+                  f"FAIL: expected {expected} tests, "
+                  f"found {discovered}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          runner = unittest.TextTestRunner(
+              verbosity=2
+          )
+
+          result = runner.run(suite)
+
+          if not result.wasSuccessful():
+              sys.exit(1)
+
+          if result.testsRun != expected:
+              print(
+                  "FAIL: unexpected executed test count",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          print(
+              "VRTA v0.2 complete validation: PASS"
+          )
+          PY
+
+      # --------------------------------------------------
+      # 10. Success summary
+      # --------------------------------------------------
 
       - name: Validation summary
         if: success()
         run: |
           echo "======================================"
-          echo "Virtual-Real Transition Axis v0.1"
+          echo "Virtual-Real Transition Axis v0.2"
           echo "======================================"
-          echo "Python syntax: PASS"
-          echo "Simulation: PASS"
-          echo "Unit tests: PASS"
-          echo "Simulation output: PASS"
+          echo "Python: ${{ matrix.python-version }}"
+          echo "Syntax validation: PASS"
+          echo "Legacy simulation: PASS"
+          echo "v0.1 regression: 15 tests"
+          echo "v0.2 evidence: 25 tests"
+          echo "v0.2 five-elements: 30 tests"
+          echo "Total: 70 tests"
+          echo "Overall validation: PASS"
           echo "======================================"
+
+          {
+            echo "## VRTA v0.2 Validation"
+            echo ""
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| Python | ${{ matrix.python-version }} |"
+            echo "| Syntax | PASS |"
+            echo "| Legacy simulation | PASS |"
+            echo "| v0.1 regression | 15 tests |"
+            echo "| Evidence verification | 25 tests |"
+            echo "| Five-element authority | 30 tests |"
+            echo "| Complete suite | 70 tests PASS |"
+          } >> "$GITHUB_STEP_SUMMARY"
