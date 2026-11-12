@@ -30,16 +30,17 @@ jobs:
           - "3.13"
 
     steps:
-      # --------------------------------------------------
+
+      # ==================================================
       # 1. Checkout repository
-      # --------------------------------------------------
+      # ==================================================
 
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # --------------------------------------------------
+      # ==================================================
       # 2. Set up Python
-      # --------------------------------------------------
+      # ==================================================
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -51,11 +52,11 @@ jobs:
           python --version
           python -c "import sys; print(sys.executable)"
 
-      # --------------------------------------------------
-      # 3. Check required repository files
-      # --------------------------------------------------
+      # ==================================================
+      # 3. Check required files
+      # ==================================================
 
-      - name: Check required files
+      - name: Check required repository files
         shell: bash
         run: |
           set -euo pipefail
@@ -75,17 +76,18 @@ jobs:
 
           for file in "${files[@]}"; do
             if [[ ! -f "$file" ]]; then
-              echo "Missing required file: $file"
+              echo "FAIL: Missing required file: $file"
               exit 1
             fi
+
             echo "FOUND: $file"
           done
 
-          echo "Required file check: PASS"
+          echo "Required file validation: PASS"
 
-      # --------------------------------------------------
+      # ==================================================
       # 4. Python syntax validation
-      # --------------------------------------------------
+      # ==================================================
 
       - name: Validate Python syntax
         shell: bash
@@ -104,17 +106,20 @@ jobs:
 
           echo "Python syntax validation: PASS"
 
-      # --------------------------------------------------
+      # ==================================================
       # 5. Legacy v0.1 simulation
-      # --------------------------------------------------
+      # ==================================================
 
-      - name: Run legacy axis simulation
+      - name: Run legacy v0.1 simulation
+        shell: bash
         run: |
+          set -euo pipefail
+
           python axis.py
 
-      # --------------------------------------------------
+      # ==================================================
       # 6. Validate legacy simulation output
-      # --------------------------------------------------
+      # ==================================================
 
       - name: Validate legacy simulation output
         shell: bash
@@ -140,7 +145,9 @@ jobs:
 
           for line in "${expected[@]}"; do
             if ! grep -Fxq "$line" legacy-output.txt; then
-              echo "Missing expected output: $line"
+              echo "FAIL: Missing expected output:"
+              echo "$line"
+              echo ""
               cat legacy-output.txt
               exit 1
             fi
@@ -148,17 +155,20 @@ jobs:
 
           echo "Legacy simulation validation: PASS"
 
-      # --------------------------------------------------
+      # ==================================================
       # 7. v0.3 feedback simulation
-      # --------------------------------------------------
+      # ==================================================
 
-      - name: Run feedback simulation
+      - name: Run v0.3 feedback simulation
+        shell: bash
         run: |
+          set -euo pipefail
+
           python feedback.py
 
-      # --------------------------------------------------
-      # 8. Validate feedback simulation
-      # --------------------------------------------------
+      # ==================================================
+      # 8. Validate feedback simulation output
+      # ==================================================
 
       - name: Validate feedback simulation output
         shell: bash
@@ -167,21 +177,22 @@ jobs:
 
           python feedback.py > feedback-output.txt
 
-          grep -Fq \
-            "reason=virtual_overload" \
-            feedback-output.txt
+          expected=(
+            "reason=virtual_overload"
+            "reason=hysteresis_hold"
+            "reason=recovery_pending"
+            "reason=recovery_eligible"
+          )
 
-          grep -Fq \
-            "reason=hysteresis_hold" \
-            feedback-output.txt
-
-          grep -Fq \
-            "reason=recovery_pending" \
-            feedback-output.txt
-
-          grep -Fq \
-            "reason=recovery_eligible" \
-            feedback-output.txt
+          for value in "${expected[@]}"; do
+            if ! grep -Fq "$value" feedback-output.txt; then
+              echo "FAIL: Missing feedback output:"
+              echo "$value"
+              echo ""
+              cat feedback-output.txt
+              exit 1
+            fi
+          done
 
           grep -Fxq \
             "final simulated mode: normal" \
@@ -193,9 +204,9 @@ jobs:
 
           echo "Feedback simulation validation: PASS"
 
-      # --------------------------------------------------
-      # 9. Validate test discovery and execute suite
-      # --------------------------------------------------
+      # ==================================================
+      # 9. Validate discovery and run 105 tests
+      # ==================================================
 
       - name: Run complete 105-test suite
         shell: bash
@@ -215,12 +226,19 @@ jobs:
 
           loader = unittest.TestLoader()
 
-          # Validate each test module's discovery count.
+          # ----------------------------------------------
+          # Validate discovery for each test file.
+          #
+          # Do not specify top_level_dir=".".
+          # The tests directory does not require
+          # an __init__.py file.
+          # ----------------------------------------------
+
           for filename, expected in expected_by_file.items():
+
               suite = loader.discover(
                   start_dir="tests",
                   pattern=filename,
-                  top_level_dir=".",
               )
 
               discovered = suite.countTestCases()
@@ -233,17 +251,19 @@ jobs:
 
               if discovered != expected:
                   print(
-                      f"FAIL: unexpected test count "
-                      f"in {filename}",
+                      f"FAIL: expected {expected} tests "
+                      f"in {filename}, found {discovered}",
                       file=sys.stderr,
                   )
                   sys.exit(1)
 
-          # Discover all tests once for execution.
+          # ----------------------------------------------
+          # Discover complete test suite.
+          # ----------------------------------------------
+
           suite = loader.discover(
               start_dir="tests",
               pattern="test_*.py",
-              top_level_dir=".",
           )
 
           expected_total = sum(
@@ -264,6 +284,10 @@ jobs:
                   file=sys.stderr,
               )
               sys.exit(1)
+
+          # ----------------------------------------------
+          # Execute complete suite.
+          # ----------------------------------------------
 
           runner = unittest.TextTestRunner(
               verbosity=2
@@ -291,9 +315,9 @@ jobs:
           )
           PY
 
-      # --------------------------------------------------
+      # ==================================================
       # 10. v0.3 axis integration smoke test
-      # --------------------------------------------------
+      # ==================================================
 
       - name: Validate v0.3 axis integration
         shell: bash
@@ -305,6 +329,7 @@ jobs:
               Mode,
               TransitionAxisV3,
           )
+
           from feedback import LoadObservation
 
           admin = object()
@@ -333,6 +358,10 @@ jobs:
               Mode.NORMAL,
           ]
 
+          # ----------------------------------------------
+          # Validate degradation and recovery.
+          # ----------------------------------------------
+
           for sample, expected in zip(
               samples,
               expected_modes,
@@ -341,50 +370,82 @@ jobs:
 
               axis.observe_load(
                   LoadObservation(
-                      window_id,
-                      virtual,
-                      real,
+                      window_id=window_id,
+                      virtual_load=virtual,
+                      real_load=real,
                   )
               )
 
-              assert axis.mode == expected, (
-                  f"Window {window_id}: "
-                  f"expected {expected.value}, "
-                  f"got {axis.mode.value}"
-              )
+              if axis.mode != expected:
+                  raise AssertionError(
+                      f"Window {window_id}: "
+                      f"expected {expected.value}, "
+                      f"got {axis.mode.value}"
+                  )
 
               print(
                   f"window={window_id} "
                   f"mode={axis.mode.value}"
               )
 
-          assert axis.audit.verify()
+          if not axis.audit.verify():
+              raise AssertionError(
+                  "Audit chain verification failed"
+              )
 
+          # ----------------------------------------------
           # Zero-neutral cannot be exited by feedback.
-          axis.neutralize("integration test")
+          # ----------------------------------------------
 
-          axis.observe_load(
-              LoadObservation(6, 0.0, 0.0)
+          axis.neutralize(
+              "integration test"
           )
 
-          assert axis.mode == Mode.ZERO_NEUTRAL
+          axis.observe_load(
+              LoadObservation(
+                  window_id=6,
+                  virtual_load=0.0,
+                  real_load=0.0,
+              )
+          )
 
-          # Recovery requires both simulation conditions.
-          assert not axis.recover(
+          if axis.mode != Mode.ZERO_NEUTRAL:
+              raise AssertionError(
+                  "Feedback escaped zero-neutral mode"
+              )
+
+          # ----------------------------------------------
+          # Recovery without approval must be denied.
+          # ----------------------------------------------
+
+          recovered = axis.recover(
               safety_verified=True,
               human_approved=False,
           )
 
-          assert axis.mode == Mode.ZERO_NEUTRAL
+          if recovered:
+              raise AssertionError(
+                  "Recovery unexpectedly succeeded"
+              )
 
-          assert axis.audit.verify()
+          if axis.mode != Mode.ZERO_NEUTRAL:
+              raise AssertionError(
+                  "Axis mode changed without approval"
+              )
 
-          print("VRTA v0.3 integration: PASS")
+          if not axis.audit.verify():
+              raise AssertionError(
+                  "Final audit verification failed"
+              )
+
+          print(
+              "VRTA v0.3 integration: PASS"
+          )
           PY
 
-      # --------------------------------------------------
+      # ==================================================
       # 11. GitHub Actions summary
-      # --------------------------------------------------
+      # ==================================================
 
       - name: Write validation summary
         if: success()
@@ -404,7 +465,7 @@ jobs:
             echo "| v0.2 five-elements | 30 tests |"
             echo "| v0.3 feedback | 35 tests |"
             echo "| Complete suite | 105 tests PASS |"
-            echo "| v0.3 integration smoke test | PASS |"
+            echo "| v0.3 integration | PASS |"
             echo ""
             echo "Experimental behavioral validation only."
           } >> "$GITHUB_STEP_SUMMARY"
@@ -413,8 +474,10 @@ jobs:
           echo "Virtual-Real Transition Axis v0.3"
           echo "======================================"
           echo "Python: ${{ matrix.python-version }}"
+          echo "Syntax validation: PASS"
           echo "Legacy simulation: PASS"
           echo "Feedback simulation: PASS"
           echo "Unit tests: 105 PASS"
           echo "Axis integration: PASS"
           echo "======================================"
+
