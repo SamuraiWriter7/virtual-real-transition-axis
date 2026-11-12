@@ -1,18 +1,15 @@
-"""Virtual-Real Transition Axis v0.2.
+"""Virtual-Real Transition Axis v0.3.
 
 Python 3.11+.
 Standard library only.
 
-Includes:
-- v0.1 legacy behavioral reference
-- v0.2 independent evidence verification
-- Five-element authority restrictions
-- Authority generation invalidation
-- Zero-neutralization and recovery
-- In-memory hash-chained audit
+Versions:
+- TransitionAxis: v0.1 legacy reference
+- TransitionAxisV2: evidence and five-element control
+- TransitionAxisV3: seesaw negative feedback integration
 
-This is an experimental reference implementation.
-It is not a production security boundary.
+Experimental behavioral prototype.
+Not a production security boundary.
 """
 
 from __future__ import annotations
@@ -30,6 +27,7 @@ from evidence import (
     VerificationReceipt,
     canonical_json,
 )
+
 from five_elements import (
     Element,
     FiveElementError,
@@ -39,9 +37,19 @@ from five_elements import (
     RestrictionRequest,
 )
 
+from feedback import (
+    FeedbackConfig,
+    FeedbackController,
+    FeedbackDecision,
+    FeedbackError,
+    FeedbackMode,
+    FeedbackReason,
+    LoadObservation,
+)
+
 
 # ============================================================
-# 1. Operating modes and authority types
+# 1. Basic types
 # ============================================================
 
 class Mode(str, Enum):
@@ -56,15 +64,15 @@ class Role(str, Enum):
 
 
 class AxisError(Exception):
-    """Base exception for rejected axis operations."""
+    """Base axis exception."""
 
 
 class AuthorityError(AxisError):
-    """An operation is not authorized."""
+    """Operation is not authorized."""
 
 
 class ValidationError(AxisError):
-    """Input or configuration is invalid."""
+    """Invalid input or configuration."""
 
 
 @dataclass(frozen=True)
@@ -82,14 +90,14 @@ class ElementToken:
 
 
 # ============================================================
-# 2. Hash-chained audit log
+# 2. Audit log
 # ============================================================
 
 class AuditLog:
-    """In-memory SHA-256 hash-chained audit records.
+    """In-memory SHA-256 hash-chained audit.
 
-    Detects modifications without recomputing the chain.
-    Does not provide external tamper resistance.
+    This detects simple record modification.
+    It does not protect against a process-level attacker.
     """
 
     def __init__(self) -> None:
@@ -164,27 +172,22 @@ class AuditLog:
 
 
 # ============================================================
-# 3. v0.1 legacy reference implementation
+# 3. v0.1 compatibility
 # ============================================================
 
 class TransitionAxis:
-    """VRTA v0.1 compatibility reference.
+    """Original v0.1 behavioral reference.
 
-    This class preserves the original simulation behavior.
-
-    IMPORTANT:
-    The caller-supplied verified flag is NOT secure.
-    New v0.2 integrations must use TransitionAxisV2.
+    The verified Boolean is a simulation flag.
+    Do not use this class for v0.2/v0.3 authorization.
     """
 
-    HARD_POLICY = frozenset(
-        {
-            "virtual_cannot_execute_real",
-            "unverified_evidence_cannot_execute",
-            "stale_authority_is_rejected",
-            "human_approval_required_for_recovery",
-        }
-    )
+    HARD_POLICY = frozenset({
+        "virtual_cannot_execute_real",
+        "unverified_evidence_cannot_execute",
+        "stale_authority_is_rejected",
+        "human_approval_required_for_recovery",
+    })
 
     def __init__(
         self,
@@ -199,7 +202,6 @@ class TransitionAxis:
         self.virtual_load = 0
         self.mode = Mode.NORMAL
         self.generation = 0
-
         self.tokens: dict[str, Token] = {}
         self.audit = AuditLog()
 
@@ -251,6 +253,11 @@ class TransitionAxis:
         token: Token,
         required: Role,
     ) -> None:
+        if not isinstance(token, Token):
+            raise AuthorityError(
+                "invalid token type"
+            )
+
         registered = self.tokens.get(
             token.token_id
         )
@@ -325,16 +332,14 @@ class TransitionAxis:
         *,
         verified: bool,
     ) -> bool:
-        """Legacy simulation only."""
+        """Legacy v0.1 simulation only."""
         self._authorize(token, Role.REAL)
 
-        allowed = {
+        if operation not in {
             "analyze",
             "record",
             "propose",
-        }
-
-        if operation not in allowed:
+        }:
             raise AuthorityError(
                 "real operation is not permitted"
             )
@@ -397,7 +402,6 @@ class TransitionAxis:
                     "human_approved": human_approved,
                 },
             )
-
             return False
 
         self.mode = Mode.NORMAL
@@ -426,21 +430,17 @@ class TransitionAxis:
 
 
 # ============================================================
-# 4. v0.2 independent transition axis
+# 4. v0.2 evidence and five-element integration
 # ============================================================
 
 class TransitionAxisV2(TransitionAxis):
-    """VRTA v0.2 reference controller.
+    """v0.2 independent evidence and authority controller."""
 
-    Evidence and authority decisions are coordinated
-    by the axis.
-
-    All trust boundaries remain application-level.
-    """
-
-    ALLOWED_REAL_OPERATIONS = frozenset(
-        {"analyze", "record", "propose"}
-    )
+    ALLOWED_REAL_OPERATIONS = frozenset({
+        "analyze",
+        "record",
+        "propose",
+    })
 
     def __init__(
         self,
@@ -462,11 +462,9 @@ class TransitionAxisV2(TransitionAxis):
         self._administrator = administrator
 
         self._accepted_events: set[str] = set()
-
         self._evidence_records: dict[
             str, EvidenceRecord
         ] = {}
-
         self._receipts: dict[
             str, VerificationReceipt
         ] = {}
@@ -474,13 +472,11 @@ class TransitionAxisV2(TransitionAxis):
         self._configured_elements: dict[
             str, Element
         ] = {}
-
         self._element_tokens: dict[
             str, ElementToken
         ] = {}
 
         self._used_request_ids: set[str] = set()
-
         self._active_restrictions: set[
             RestrictionAction
         ] = set()
@@ -518,10 +514,6 @@ class TransitionAxisV2(TransitionAxis):
             },
         )
 
-    # --------------------------------------------------------
-    # Internal evidence lookups
-    # --------------------------------------------------------
-
     def _event_accepted(
         self,
         event_id: str,
@@ -535,10 +527,6 @@ class TransitionAxisV2(TransitionAxis):
         return self._evidence_records.get(
             evidence_id
         )
-
-    # --------------------------------------------------------
-    # Role token issuance
-    # --------------------------------------------------------
 
     def issue_token(
         self,
@@ -559,7 +547,6 @@ class TransitionAxisV2(TransitionAxis):
         self,
         token_id: str,
     ) -> ElementToken:
-        """Issue only preconfigured element authority."""
         if self.mode == Mode.ZERO_NEUTRAL:
             raise AuthorityError(
                 "element issuance blocked in neutral mode"
@@ -627,19 +614,12 @@ class TransitionAxisV2(TransitionAxis):
 
         return token.element
 
-    # --------------------------------------------------------
-    # Virtual event intake
-    # --------------------------------------------------------
-
     def receive_virtual(
         self,
         token: Token,
         event: dict[str, Any],
     ) -> str:
-        self._authorize(
-            token,
-            Role.VIRTUAL,
-        )
+        self._authorize(token, Role.VIRTUAL)
 
         if not isinstance(event, dict):
             raise ValidationError(
@@ -667,7 +647,6 @@ class TransitionAxisV2(TransitionAxis):
                     "reason": "active_restriction",
                 },
             )
-
             raise AuthorityError(
                 "virtual intake is restricted"
             )
@@ -680,7 +659,6 @@ class TransitionAxisV2(TransitionAxis):
                     "reason": "duplicate_event",
                 },
             )
-
             raise ValidationError(
                 "duplicate event identifier"
             )
@@ -691,25 +669,14 @@ class TransitionAxisV2(TransitionAxis):
         )
 
         if result == "accepted":
-            self._accepted_events.add(
-                event_id
-            )
+            self._accepted_events.add(event_id)
 
         return result
-
-    # --------------------------------------------------------
-    # Independent evidence verification
-    # --------------------------------------------------------
 
     def verify_evidence(
         self,
         evidence: Mapping[str, Any] | EvidenceRecord,
     ) -> VerificationReceipt:
-        """Verify evidence and register an internal receipt.
-
-        The operation is coordinated synchronously by
-        the axis; it is not distributed or thread-safe.
-        """
         if self.mode == Mode.ZERO_NEUTRAL:
             raise AuthorityError(
                 "verification blocked in neutral mode"
@@ -721,13 +688,11 @@ class TransitionAxisV2(TransitionAxis):
                 generation=self.generation,
             )
 
-            # Snapshot the payload to avoid retaining
-            # a caller-owned mutable JSON object.
             snapshot_payload = json.loads(
                 canonical_json(record.payload)
             )
 
-            stored_record = EvidenceRecord(
+            stored = EvidenceRecord(
                 evidence_id=record.evidence_id,
                 event_id=record.event_id,
                 source_id=record.source_id,
@@ -735,10 +700,7 @@ class TransitionAxisV2(TransitionAxis):
                 payload_digest=record.payload_digest,
             )
 
-            if (
-                stored_record.evidence_id
-                in self._evidence_records
-            ):
+            if stored.evidence_id in self._evidence_records:
                 raise ValidationError(
                     "duplicate evidence identifier"
                 )
@@ -749,8 +711,8 @@ class TransitionAxisV2(TransitionAxis):
                 )
 
             self._evidence_records[
-                stored_record.evidence_id
-            ] = stored_record
+                stored.evidence_id
+            ] = stored
 
             self._receipts[
                 receipt.receipt_id
@@ -776,7 +738,6 @@ class TransitionAxisV2(TransitionAxis):
                     "generation": self.generation,
                 },
             )
-
             raise
 
     def _validate_receipt(
@@ -788,9 +749,7 @@ class TransitionAxisV2(TransitionAxis):
                 "invalid receipt identifier"
             )
 
-        receipt = self._receipts.get(
-            receipt_id
-        )
+        receipt = self._receipts.get(receipt_id)
 
         if receipt is None:
             raise AuthorityError(
@@ -807,9 +766,7 @@ class TransitionAxisV2(TransitionAxis):
                 "receipt is not verified"
             )
 
-        if receipt.verifier_id != (
-            self._verifier.verifier_id
-        ):
+        if receipt.verifier_id != self._verifier.verifier_id:
             raise AuthorityError(
                 "unexpected verifier identity"
             )
@@ -825,25 +782,18 @@ class TransitionAxisV2(TransitionAxis):
 
         if (
             receipt.event_id != record.event_id
-            or receipt.payload_digest
-            != record.payload_digest
+            or receipt.payload_digest != record.payload_digest
         ):
             raise AuthorityError(
                 "receipt evidence binding mismatch"
             )
 
-        if not self._event_accepted(
-            receipt.event_id
-        ):
+        if not self._event_accepted(receipt.event_id):
             raise AuthorityError(
                 "receipt event is not accepted"
             )
 
         return receipt
-
-    # --------------------------------------------------------
-    # Block legacy verification bypass
-    # --------------------------------------------------------
 
     def execute_real(
         self,
@@ -852,7 +802,7 @@ class TransitionAxisV2(TransitionAxis):
         *,
         verified: bool,
     ) -> bool:
-        """Never accept the v0.1 Boolean verification path."""
+        """Block the v0.1 self-verification path."""
         self.audit.append(
             "legacy_operation_denied",
             {
@@ -862,12 +812,8 @@ class TransitionAxisV2(TransitionAxis):
         )
 
         raise AuthorityError(
-            "v0.2 requires a registered evidence receipt"
+            "v0.2+ requires a registered evidence receipt"
         )
-
-    # --------------------------------------------------------
-    # Verified real operations
-    # --------------------------------------------------------
 
     def execute_real_verified(
         self,
@@ -878,24 +824,15 @@ class TransitionAxisV2(TransitionAxis):
         evidence_id: str | None = None,
         event_id: str | None = None,
     ) -> bool:
-        """Authorize a simulated operation using stored evidence."""
         try:
-            self._authorize(
-                token,
-                Role.REAL,
-            )
+            self._authorize(token, Role.REAL)
 
-            if (
-                operation
-                not in self.ALLOWED_REAL_OPERATIONS
-            ):
+            if operation not in self.ALLOWED_REAL_OPERATIONS:
                 raise AuthorityError(
                     "real operation is not permitted"
                 )
 
-            receipt = self._validate_receipt(
-                receipt_id
-            )
+            receipt = self._validate_receipt(receipt_id)
 
             if (
                 evidence_id is not None
@@ -950,29 +887,18 @@ class TransitionAxisV2(TransitionAxis):
 
             raise
 
-    # --------------------------------------------------------
-    # Five-element authority requests
-    # --------------------------------------------------------
-
     def request_restriction(
         self,
         token: ElementToken,
-        request: (
-            Mapping[str, Any] | RestrictionRequest
-        ),
+        request: Mapping[str, Any] | RestrictionRequest,
     ) -> RestrictionDecision:
-        """Validate a request and apply bounded restrictions."""
         try:
-            actual_element = self._authorize_element(
-                token
-            )
+            actual_element = self._authorize_element(token)
 
             parsed = (
                 request
                 if isinstance(request, RestrictionRequest)
-                else RestrictionRequest.from_mapping(
-                    request
-                )
+                else RestrictionRequest.from_mapping(request)
             )
 
             if parsed.source_element != actual_element:
@@ -985,13 +911,9 @@ class TransitionAxisV2(TransitionAxis):
                     "duplicate restriction request"
                 )
 
-            decision = FiveElementMatrix.validate(
-                parsed
-            )
+            decision = FiveElementMatrix.validate(parsed)
 
-            self._used_request_ids.add(
-                parsed.request_id
-            )
+            self._used_request_ids.add(parsed.request_id)
 
             if decision.restrictive:
                 self._active_restrictions.add(
@@ -1005,7 +927,6 @@ class TransitionAxisV2(TransitionAxis):
                         "action": decision.action.value,
                     },
                 )
-
             else:
                 self.audit.append(
                     "restriction_advisory_accepted",
@@ -1017,10 +938,7 @@ class TransitionAxisV2(TransitionAxis):
 
             return decision
 
-        except (
-            FiveElementError,
-            AuthorityError,
-        ) as exc:
+        except (FiveElementError, AuthorityError) as exc:
             self.audit.append(
                 "restriction_denied",
                 {
@@ -1036,27 +954,17 @@ class TransitionAxisV2(TransitionAxis):
     ) -> bool:
         return action in self._active_restrictions
 
-    # --------------------------------------------------------
-    # Administrative restriction release
-    # --------------------------------------------------------
-
     def release_restriction(
         self,
         *,
         administrator: object,
         action: RestrictionAction,
     ) -> bool:
-        """Release a restriction through bootstrap authority.
-
-        The administrator object is an in-process capability.
-        It is not a cryptographically authenticated principal.
-        """
         if administrator is not self._administrator:
             self.audit.append(
                 "restriction_release_denied",
                 {"reason": "unauthorized_administrator"},
             )
-
             raise AuthorityError(
                 "administrator capability required"
             )
@@ -1074,9 +982,7 @@ class TransitionAxisV2(TransitionAxis):
         if action not in self._active_restrictions:
             return False
 
-        self._active_restrictions.remove(
-            action
-        )
+        self._active_restrictions.remove(action)
 
         self.audit.append(
             "restriction_released",
@@ -1085,15 +991,9 @@ class TransitionAxisV2(TransitionAxis):
 
         return True
 
-    # --------------------------------------------------------
-    # Neutralization and recovery
-    # --------------------------------------------------------
-
     def neutralize(self, reason: str) -> None:
         super().neutralize(reason)
 
-        # Old receipts remain recorded but cannot be
-        # used under the new authority generation.
         self._accepted_events.clear()
 
         self.audit.append(
@@ -1130,9 +1030,6 @@ class TransitionAxisV2(TransitionAxis):
     def reset_virtual_load(self) -> None:
         super().reset_virtual_load()
 
-        # A reset starts a new simulated event window.
-        # Previously accepted events are no longer
-        # eligible for new verification.
         self._accepted_events.clear()
 
         self.audit.append(
@@ -1142,11 +1039,403 @@ class TransitionAxisV2(TransitionAxis):
 
 
 # ============================================================
-# 5. Legacy deterministic simulation
+# 5. v0.3 seesaw feedback integration
+# ============================================================
+
+class TransitionAxisV3(TransitionAxisV2):
+    """Independent axis with deterministic feedback control.
+
+    The controller is used only through axis-owned evaluation.
+
+    No public API accepts an arbitrary FeedbackDecision
+    as authority to change the operating mode.
+
+    The reference implementation assumes sequential access.
+    """
+
+    def __init__(
+        self,
+        *,
+        virtual_limit: int = 3,
+        trusted_sources: frozenset[str],
+        element_bindings: Mapping[str, Element],
+        administrator: object,
+        feedback_config: FeedbackConfig | None = None,
+    ) -> None:
+        super().__init__(
+            virtual_limit=virtual_limit,
+            trusted_sources=trusted_sources,
+            element_bindings=element_bindings,
+            administrator=administrator,
+        )
+
+        self._feedback_controller = FeedbackController(
+            feedback_config
+        )
+
+        # Independent degradation causes.
+        self._feedback_degraded = False
+        self._legacy_degraded = False
+
+        self.audit.append(
+            "axis_v0.3_initialized",
+            {
+                "degrade_threshold": (
+                    self._feedback_controller
+                    .config.degrade_threshold
+                ),
+                "recover_threshold": (
+                    self._feedback_controller
+                    .config.recover_threshold
+                ),
+                "stable_windows_required": (
+                    self._feedback_controller
+                    .config.stable_windows_required
+                ),
+            },
+        )
+
+    # --------------------------------------------------------
+    # Read-only diagnostics
+    # --------------------------------------------------------
+
+    @property
+    def feedback_history(
+        self,
+    ) -> tuple[LoadObservation, ...]:
+        return self._feedback_controller.history
+
+    @property
+    def feedback_stable_count(self) -> int:
+        return self._feedback_controller.stable_count
+
+    @property
+    def degradation_causes(self) -> tuple[str, ...]:
+        causes = []
+
+        if self._legacy_degraded:
+            causes.append("virtual_event_limit")
+
+        if self._feedback_degraded:
+            causes.append("feedback_overload")
+
+        return tuple(causes)
+
+    def feedback_snapshot(self) -> dict[str, Any]:
+        """Return diagnostic data without granting authority."""
+        snapshot = self._feedback_controller.snapshot()
+
+        return {
+            "axis_mode": self.mode.value,
+            "generation": self.generation,
+            "degradation_causes": self.degradation_causes,
+            "controller": snapshot,
+        }
+
+    # --------------------------------------------------------
+    # Authoritative state synchronization
+    # --------------------------------------------------------
+
+    def _synchronize_mode(
+        self,
+        *,
+        reason: str,
+    ) -> None:
+        """Recompute the mode from active degradation causes.
+
+        Zero-neutral always has priority.
+        """
+        if self.mode == Mode.ZERO_NEUTRAL:
+            return
+
+        previous = self.mode
+
+        if (
+            self._feedback_degraded
+            or self._legacy_degraded
+        ):
+            self.mode = Mode.DEGRADED
+        else:
+            self.mode = Mode.NORMAL
+
+        if self.mode != previous:
+            self.audit.append(
+                "axis_mode_transition",
+                {
+                    "previous_mode": previous.value,
+                    "new_mode": self.mode.value,
+                    "reason": reason,
+                    "causes": list(
+                        self.degradation_causes
+                    ),
+                    "generation": self.generation,
+                },
+            )
+
+    # --------------------------------------------------------
+    # Legacy virtual-event degradation
+    # --------------------------------------------------------
+
+    def receive_virtual(
+        self,
+        token: Token,
+        event: dict[str, Any],
+    ) -> str:
+        """Preserve event-count backpressure independently."""
+        result = super().receive_virtual(
+            token,
+            event,
+        )
+
+        if result == "backpressure":
+            self._legacy_degraded = True
+
+            self.audit.append(
+                "legacy_degradation_activated",
+                {
+                    "virtual_load": self.virtual_load,
+                    "virtual_limit": self.virtual_limit,
+                },
+            )
+
+        self._synchronize_mode(
+            reason="virtual_event_intake"
+        )
+
+        return result
+
+    def reset_virtual_load(self) -> None:
+        """Clear only the legacy event-count degradation cause.
+
+        Feedback degradation is intentionally preserved.
+        """
+        if self.mode == Mode.ZERO_NEUTRAL:
+            raise AuthorityError(
+                "cannot reset while neutralized"
+            )
+
+        # The v0.2 parent implementation also resets
+        # accepted-event bindings.
+        super().reset_virtual_load()
+
+        self._legacy_degraded = False
+
+        self._synchronize_mode(
+            reason="legacy_window_reset"
+        )
+
+        self.audit.append(
+            "legacy_degradation_cleared",
+            {
+                "feedback_degraded": (
+                    self._feedback_degraded
+                ),
+                "generation": self.generation,
+            },
+        )
+
+    # --------------------------------------------------------
+    # Axis-owned feedback evaluation
+    # --------------------------------------------------------
+
+    def observe_load(
+        self,
+        observation: (
+            Mapping[str, Any] | LoadObservation
+        ),
+    ) -> FeedbackDecision:
+        """Observe load and apply bounded feedback decisions.
+
+        The caller supplies an observation, not a mode decision.
+
+        The independent axis uses its own controller to
+        evaluate the observation and update only the
+        feedback-related degradation cause.
+        """
+        previous_mode = self.mode
+
+        # The controller evaluates its own active feedback
+        # condition, not the combined axis degradation state.
+        #
+        # This separation prevents an unrelated legacy
+        # degradation cause from being cleared by feedback.
+        if self.mode == Mode.ZERO_NEUTRAL:
+            feedback_mode = FeedbackMode.ZERO_NEUTRAL
+        elif self._feedback_degraded:
+            feedback_mode = FeedbackMode.DEGRADED
+        else:
+            feedback_mode = FeedbackMode.NORMAL
+
+        try:
+            decision = self._feedback_controller.evaluate(
+                observation,
+                current_mode=feedback_mode,
+            )
+
+        except FeedbackError as exc:
+            self.audit.append(
+                "feedback_observation_denied",
+                {
+                    "reason": type(exc).__name__,
+                    "generation": self.generation,
+                },
+            )
+            raise
+
+        # Zero-neutral cannot be exited by feedback.
+        if self.mode == Mode.ZERO_NEUTRAL:
+            self.audit.append(
+                "feedback_zero_neutral_hold",
+                {
+                    "window_id": decision.window_id,
+                    "reason": decision.reason.value,
+                },
+            )
+            return decision
+
+        if decision.recommended_mode == FeedbackMode.DEGRADED:
+            self._feedback_degraded = True
+
+        elif decision.recommended_mode == FeedbackMode.NORMAL:
+            self._feedback_degraded = False
+
+        else:
+            # Defensive check: never allow an unexpected
+            # recommendation to cause a state transition.
+            self.audit.append(
+                "feedback_decision_denied",
+                {
+                    "window_id": decision.window_id,
+                    "reason": "unexpected_mode",
+                },
+            )
+            raise ValidationError(
+                "unexpected feedback recommendation"
+            )
+
+        self._synchronize_mode(
+            reason=decision.reason.value
+        )
+
+        # Always record the accepted observation and decision.
+        self.audit.append(
+            "feedback_decision",
+            {
+                "window_id": decision.window_id,
+                "virtual_load": decision.virtual_load,
+                "real_load": decision.real_load,
+                "virtual_overloaded": (
+                    decision.virtual_overloaded
+                ),
+                "real_overloaded": (
+                    decision.real_overloaded
+                ),
+                "stable_count": decision.stable_count,
+                "reason": decision.reason.value,
+                "recommended_mode": (
+                    decision.recommended_mode.value
+                ),
+                "previous_axis_mode": previous_mode.value,
+                "final_axis_mode": self.mode.value,
+                "remaining_causes": list(
+                    self.degradation_causes
+                ),
+                "generation": self.generation,
+            },
+        )
+
+        if decision.reason == FeedbackReason.RECOVERY_ELIGIBLE:
+            self.audit.append(
+                "feedback_recovery_evaluated",
+                {
+                    "window_id": decision.window_id,
+                    "accepted": (
+                        self.mode == Mode.NORMAL
+                    ),
+                    "remaining_causes": list(
+                        self.degradation_causes
+                    ),
+                },
+            )
+
+        return decision
+
+    # --------------------------------------------------------
+    # Emergency neutralization
+    # --------------------------------------------------------
+
+    def neutralize(self, reason: str) -> None:
+        """Apply emergency neutralization with highest priority."""
+        super().neutralize(reason)
+
+        # The emergency boundary supersedes both
+        # feedback and legacy degradation.
+        self._feedback_degraded = False
+        self._legacy_degraded = False
+
+        self._feedback_controller.reset()
+
+        self.audit.append(
+            "v0.3_feedback_neutralized",
+            {
+                "generation": self.generation,
+                "feedback_history_reset": True,
+                "five_element_restrictions_preserved": True,
+            },
+        )
+
+    # --------------------------------------------------------
+    # Controlled recovery
+    # --------------------------------------------------------
+
+    def recover(
+        self,
+        *,
+        safety_verified: bool,
+        human_approved: bool,
+    ) -> bool:
+        """Preserve independent recovery requirements.
+
+        Feedback cannot invoke recovery implicitly.
+
+        The two Boolean conditions remain v0.1/v0.2
+        simulation flags, not authenticated approvals.
+        """
+        result = super().recover(
+            safety_verified=safety_verified,
+            human_approved=human_approved,
+        )
+
+        if result:
+            self._feedback_degraded = False
+            self._legacy_degraded = False
+
+            self._feedback_controller.reset()
+
+            self._synchronize_mode(
+                reason="independent_recovery"
+            )
+
+            self.audit.append(
+                "v0.3_recovery_synchronized",
+                {
+                    "generation": self.generation,
+                    "mode": self.mode.value,
+                    "restrictions_preserved": True,
+                    "old_authority_invalidated": True,
+                },
+            )
+
+        return result
+
+
+# ============================================================
+# 6. Legacy simulation
 # ============================================================
 
 def main() -> None:
-    """Preserve the original v0.1 simulation output."""
+    """Preserve the v0.1 deterministic simulation output."""
+
     axis = TransitionAxis(
         virtual_limit=3
     )
