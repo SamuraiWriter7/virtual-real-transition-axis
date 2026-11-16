@@ -1508,10 +1508,12 @@ def main() -> None:
     print(
         f"records: {len(axis.audit.records)}"
     )
+    
 """Virtual–Real Transition Axis v0.1. Standard library only.
 
 Simulation, NOT a production security boundary.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
