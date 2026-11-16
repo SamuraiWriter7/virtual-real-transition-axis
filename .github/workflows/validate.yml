@@ -1,9 +1,8 @@
 name: Validate Virtual-Real Transition Axis
 
-on:
+"on":
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -18,466 +17,149 @@ jobs:
   validate:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
-
     timeout-minutes: 10
 
     strategy:
       fail-fast: false
       matrix:
-        python-version:
-          - "3.11"
-          - "3.12"
-          - "3.13"
+        python-version: ["3.11", "3.12", "3.13"]
+
+    defaults:
+      run:
+        shell: bash
 
     steps:
-
-      # ==================================================
-      # 1. Checkout repository
-      # ==================================================
-
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      # ==================================================
-      # 2. Set up Python
-      # ==================================================
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Display Python environment
+      - name: Check required files and Python syntax
         run: |
           python --version
-          python -c "import sys; print(sys.executable)"
-
-      # ==================================================
-      # 3. Check required files
-      # ==================================================
-
-      - name: Check required repository files
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          files=(
-            "axis.py"
-            "evidence.py"
-            "five_elements.py"
-            "feedback.py"
-            "tests/test_axis.py"
-            "tests/test_evidence.py"
-            "tests/test_five_elements.py"
-            "tests/test_feedback.py"
-            "specs/vrta-v0.2.md"
-            "specs/vrta-v0.3.md"
-          )
-
-          for file in "${files[@]}"; do
-            if [[ ! -f "$file" ]]; then
-              echo "FAIL: Missing required file: $file"
-              exit 1
-            fi
-
-            echo "FOUND: $file"
-          done
-
-          echo "Required file validation: PASS"
-
-      # ==================================================
-      # 4. Python syntax validation
-      # ==================================================
-
-      - name: Validate Python syntax
-        shell: bash
-        run: |
-          set -euo pipefail
-
+          test -f specs/vrta-v0.2.md
+          test -f specs/vrta-v0.3.md
+          test -f specs/vrta-v0.4.md
           python -m py_compile \
-            axis.py \
-            evidence.py \
-            five_elements.py \
-            feedback.py \
-            tests/test_axis.py \
-            tests/test_evidence.py \
-            tests/test_five_elements.py \
-            tests/test_feedback.py
+            axis.py evidence.py five_elements.py feedback.py role_rotation.py \
+            tests/test_axis.py tests/test_evidence.py tests/test_five_elements.py \
+            tests/test_feedback.py tests/test_role_rotation.py
 
-          echo "Python syntax validation: PASS"
-
-      # ==================================================
-      # 5. Legacy v0.1 simulation
-      # ==================================================
-
-      - name: Run legacy v0.1 simulation
-        shell: bash
+      - name: Validate v0.1 and v0.3 simulations
         run: |
-          set -euo pipefail
+          python axis.py > "$RUNNER_TEMP/vrta-legacy.txt"
+          cat "$RUNNER_TEMP/vrta-legacy.txt"
+          diff -u - "$RUNNER_TEMP/vrta-legacy.txt" <<'EXPECTED'
+          virtual event 1: accepted
+          virtual event 2: accepted
+          virtual event 3: accepted
+          virtual event 4: backpressure
+          mode: degraded
+          real verified analysis: True
+          neutral: zero_neutral
+          recovery check 1: False
+          recovery check 2 + approval: True
+          mode: normal
+          audit chain valid: True
+          records: 11
+          EXPECTED
 
-          python axis.py
+          python feedback.py > "$RUNNER_TEMP/vrta-feedback.txt"
+          cat "$RUNNER_TEMP/vrta-feedback.txt"
+          grep -Fq 'reason=virtual_overload' "$RUNNER_TEMP/vrta-feedback.txt"
+          grep -Fq 'reason=hysteresis_hold' "$RUNNER_TEMP/vrta-feedback.txt"
+          grep -Fq 'reason=recovery_pending' "$RUNNER_TEMP/vrta-feedback.txt"
+          grep -Fq 'reason=recovery_eligible' "$RUNNER_TEMP/vrta-feedback.txt"
+          grep -Fxq 'final simulated mode: normal' "$RUNNER_TEMP/vrta-feedback.txt"
+          grep -Fxq 'retained windows: 3' "$RUNNER_TEMP/vrta-feedback.txt"
 
-      # ==================================================
-      # 6. Validate legacy simulation output
-      # ==================================================
-
-      - name: Validate legacy simulation output
-        shell: bash
+      - name: Run 118 regression and role rotation tests
         run: |
-          set -euo pipefail
-
-          python axis.py > legacy-output.txt
-
-          expected=(
-            "virtual event 1: accepted"
-            "virtual event 2: accepted"
-            "virtual event 3: accepted"
-            "virtual event 4: backpressure"
-            "mode: degraded"
-            "real verified analysis: True"
-            "neutral: zero_neutral"
-            "recovery check 1: False"
-            "recovery check 2 + approval: True"
-            "mode: normal"
-            "audit chain valid: True"
-            "records: 11"
-          )
-
-          for line in "${expected[@]}"; do
-            if ! grep -Fxq "$line" legacy-output.txt; then
-              echo "FAIL: Missing expected output:"
-              echo "$line"
-              echo ""
-              cat legacy-output.txt
-              exit 1
-            fi
-          done
-
-          echo "Legacy simulation validation: PASS"
-
-      # ==================================================
-      # 7. v0.3 feedback simulation
-      # ==================================================
-
-      - name: Run v0.3 feedback simulation
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python feedback.py
-
-      # ==================================================
-      # 8. Validate feedback simulation output
-      # ==================================================
-
-      - name: Validate feedback simulation output
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python feedback.py > feedback-output.txt
-
-          expected=(
-            "reason=virtual_overload"
-            "reason=hysteresis_hold"
-            "reason=recovery_pending"
-            "reason=recovery_eligible"
-          )
-
-          for value in "${expected[@]}"; do
-            if ! grep -Fq "$value" feedback-output.txt; then
-              echo "FAIL: Missing feedback output:"
-              echo "$value"
-              echo ""
-              cat feedback-output.txt
-              exit 1
-            fi
-          done
-
-          grep -Fxq \
-            "final simulated mode: normal" \
-            feedback-output.txt
-
-          grep -Fxq \
-            "retained windows: 3" \
-            feedback-output.txt
-
-          echo "Feedback simulation validation: PASS"
-
-      # ==================================================
-      # 9. Validate discovery and run 105 tests
-      # ==================================================
-
-      - name: Run complete 105-test suite
-        shell: bash
-        run: |
-          set -euo pipefail
-
           python - <<'PY'
-          import sys
+          from collections import Counter
           import unittest
 
-          expected_by_file = {
-              "test_axis.py": 15,
-              "test_evidence.py": 25,
-              "test_five_elements.py": 30,
-              "test_feedback.py": 35,
-          }
+          expected = Counter({
+              "test_axis": 15,
+              "test_evidence": 25,
+              "test_five_elements": 30,
+              "test_feedback": 35,
+              "test_role_rotation": 13,
+          })
+
+          def cases(suite):
+              for entry in suite:
+                  if isinstance(entry, unittest.TestSuite):
+                      yield from cases(entry)
+                  else:
+                      yield entry
 
           loader = unittest.TestLoader()
+          # Treat tests/ as the discovery root. No tests/__init__.py required.
+          suite = loader.discover(start_dir="tests", pattern="test_*.py")
+          if loader.errors:
+              raise SystemExit("\n".join(loader.errors))
 
-          # ----------------------------------------------
-          # Validate discovery for each test file.
-          #
-          # Do not specify top_level_dir=".".
-          # The tests directory does not require
-          # an __init__.py file.
-          # ----------------------------------------------
+          counts = Counter(case.__class__.__module__ for case in cases(suite))
+          for name in sorted(counts.keys() | expected.keys()):
+              print(f"{name}: {counts[name]}/{expected[name]}", flush=True)
+          if counts != expected:
+              raise SystemExit("Unexpected per-module test counts")
 
-          for filename, expected in expected_by_file.items():
-
-              suite = loader.discover(
-                  start_dir="tests",
-                  pattern=filename,
-              )
-
-              discovered = suite.countTestCases()
-
-              print(
-                  f"{filename}: "
-                  f"{discovered}/{expected}",
-                  flush=True,
-              )
-
-              if discovered != expected:
-                  print(
-                      f"FAIL: expected {expected} tests "
-                      f"in {filename}, found {discovered}",
-                      file=sys.stderr,
-                  )
-                  sys.exit(1)
-
-          # ----------------------------------------------
-          # Discover complete test suite.
-          # ----------------------------------------------
-
-          suite = loader.discover(
-              start_dir="tests",
-              pattern="test_*.py",
-          )
-
-          expected_total = sum(
-              expected_by_file.values()
-          )
-
-          discovered_total = suite.countTestCases()
-
-          print(
-              f"Total discovered: "
-              f"{discovered_total}/{expected_total}",
-              flush=True,
-          )
-
-          if discovered_total != expected_total:
-              print(
-                  "FAIL: total test discovery mismatch",
-                  file=sys.stderr,
-              )
-              sys.exit(1)
-
-          # ----------------------------------------------
-          # Execute complete suite.
-          # ----------------------------------------------
-
-          runner = unittest.TextTestRunner(
-              verbosity=2
-          )
-
-          result = runner.run(suite)
-
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
           if not result.wasSuccessful():
-              print(
-                  "FAIL: unit test suite failed",
-                  file=sys.stderr,
-              )
-              sys.exit(1)
-
-          if result.testsRun != expected_total:
-              print(
-                  "FAIL: executed test count mismatch",
-                  file=sys.stderr,
-              )
-              sys.exit(1)
-
-          print(
-              "VRTA v0.3 unit validation: PASS",
-              flush=True,
-          )
+              raise SystemExit(1)
+          if result.testsRun != sum(expected.values()) or result.skipped or result.expectedFailures:
+              raise SystemExit("Not all required tests ran and passed")
           PY
 
-      # ==================================================
-      # 10. v0.3 axis integration smoke test
-      # ==================================================
-
-      - name: Validate v0.3 axis integration
-        shell: bash
+      - name: Run v0.3 axis integration smoke test
         run: |
-          set -euo pipefail
-
           python - <<'PY'
-          from axis import (
-              Mode,
-              TransitionAxisV3,
-          )
-
+          from axis import Mode, TransitionAxisV3
           from feedback import LoadObservation
 
-          admin = object()
-
           axis = TransitionAxisV3(
-              trusted_sources=frozenset(
-                  {"sensor-alpha"}
-              ),
+              trusted_sources=frozenset({"sensor-alpha"}),
               element_bindings={},
-              administrator=admin,
+              administrator=object(),
           )
-
           samples = [
-              (1, 0.90, 0.20),
-              (2, 0.60, 0.50),
-              (3, 0.30, 0.35),
-              (4, 0.28, 0.31),
-              (5, 0.25, 0.29),
+              (0.90, 0.20, Mode.DEGRADED),
+              (0.60, 0.50, Mode.DEGRADED),
+              (0.30, 0.35, Mode.DEGRADED),
+              (0.28, 0.31, Mode.DEGRADED),
+              (0.25, 0.29, Mode.NORMAL),
           ]
-
-          expected_modes = [
-              Mode.DEGRADED,
-              Mode.DEGRADED,
-              Mode.DEGRADED,
-              Mode.DEGRADED,
-              Mode.NORMAL,
-          ]
-
-          # ----------------------------------------------
-          # Validate degradation and recovery.
-          # ----------------------------------------------
-
-          for sample, expected in zip(
-              samples,
-              expected_modes,
-          ):
-              window_id, virtual, real = sample
-
-              axis.observe_load(
-                  LoadObservation(
-                      window_id=window_id,
-                      virtual_load=virtual,
-                      real_load=real,
-                  )
-              )
-
+          for window, (virtual, real, expected) in enumerate(samples, 1):
+              axis.observe_load(LoadObservation(window, virtual, real))
               if axis.mode != expected:
-                  raise AssertionError(
-                      f"Window {window_id}: "
-                      f"expected {expected.value}, "
-                      f"got {axis.mode.value}"
-                  )
+                  raise SystemExit(f"Window {window}: expected {expected}, got {axis.mode}")
 
-              print(
-                  f"window={window_id} "
-                  f"mode={axis.mode.value}"
-              )
-
-          if not axis.audit.verify():
-              raise AssertionError(
-                  "Audit chain verification failed"
-              )
-
-          # ----------------------------------------------
-          # Zero-neutral cannot be exited by feedback.
-          # ----------------------------------------------
-
-          axis.neutralize(
-              "integration test"
-          )
-
-          axis.observe_load(
-              LoadObservation(
-                  window_id=6,
-                  virtual_load=0.0,
-                  real_load=0.0,
-              )
-          )
-
+          axis.neutralize("integration test")
+          axis.observe_load(LoadObservation(6, 0.0, 0.0))
           if axis.mode != Mode.ZERO_NEUTRAL:
-              raise AssertionError(
-                  "Feedback escaped zero-neutral mode"
-              )
+              raise SystemExit("Feedback exited zero-neutral mode")
+          if axis.recover(safety_verified=True, human_approved=False):
+              raise SystemExit("Recovery succeeded without approval")
+          if axis.mode != Mode.ZERO_NEUTRAL or not axis.audit.verify():
+              raise SystemExit("Final mode or audit chain check failed")
 
-          # ----------------------------------------------
-          # Recovery without approval must be denied.
-          # ----------------------------------------------
-
-          recovered = axis.recover(
-              safety_verified=True,
-              human_approved=False,
-          )
-
-          if recovered:
-              raise AssertionError(
-                  "Recovery unexpectedly succeeded"
-              )
-
-          if axis.mode != Mode.ZERO_NEUTRAL:
-              raise AssertionError(
-                  "Axis mode changed without approval"
-              )
-
-          if not axis.audit.verify():
-              raise AssertionError(
-                  "Final audit verification failed"
-              )
-
-          print(
-              "VRTA v0.3 integration: PASS"
-          )
+          print("VRTA v0.3 axis integration: PASS")
           PY
 
-      # ==================================================
-      # 11. GitHub Actions summary
-      # ==================================================
-
       - name: Write validation summary
-        if: success()
-        shell: bash
         run: |
           {
-            echo "## VRTA v0.3 Validation"
-            echo ""
-            echo "| Check | Result |"
-            echo "|---|---|"
-            echo "| Python | ${{ matrix.python-version }} |"
-            echo "| Python syntax | PASS |"
-            echo "| Legacy simulation | PASS |"
-            echo "| Feedback simulation | PASS |"
-            echo "| v0.1 regression | 15 tests |"
-            echo "| v0.2 evidence | 25 tests |"
-            echo "| v0.2 five-elements | 30 tests |"
-            echo "| v0.3 feedback | 35 tests |"
-            echo "| Complete suite | 105 tests PASS |"
-            echo "| v0.3 integration | PASS |"
-            echo ""
-            echo "Experimental behavioral validation only."
+            echo '## VRTA v0.4 validation'
+            echo ''
+            echo '- Python ${{ matrix.python-version }}'
+            echo '- Syntax and deterministic simulations passed'
+            echo '- 105 existing tests and 13 role rotation tests passed'
+            echo '- Separate v0.3 axis integration smoke test passed'
           } >> "$GITHUB_STEP_SUMMARY"
-
-          echo "======================================"
-          echo "Virtual-Real Transition Axis v0.3"
-          echo "======================================"
-          echo "Python: ${{ matrix.python-version }}"
-          echo "Syntax validation: PASS"
-          echo "Legacy simulation: PASS"
-          echo "Feedback simulation: PASS"
-          echo "Unit tests: 105 PASS"
-          echo "Axis integration: PASS"
-          echo "======================================"
-
