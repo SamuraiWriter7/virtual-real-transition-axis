@@ -1508,6 +1508,250 @@ def main() -> None:
     print(
         f"records: {len(axis.audit.records)}"
     )
+"""Virtual–Real Transition Axis v0.1. Standard library only.
+
+Simulation, NOT a production security boundary.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+import hashlib
+import json
+from typing import Any
+
+
+class Denied(Exception):
+    """A policy or state-transition request was rejected."""
+
+
+class Role(str, Enum):
+    VIRTUAL = "virtual"
+    REAL = "real"
+    NEUTRAL = "neutral"
+
+
+class Mode(str, Enum):
+    NORMAL = "normal"
+    DEGRADED = "degraded"
+    ZERO_NEUTRAL = "zero_neutral"
+
+
+@dataclass(frozen=True)
+class Policy:
+    version: str = "0.1"
+    virtual_event_limit: int = 3
+    real_job_limit: int = 2
+    max_event_bytes: int = 1024
+    permitted_event_kinds: frozenset[str] = frozenset({"probe", "auth_failure", "anomaly"})
+    permitted_real_actions: frozenset[str] = frozenset({"analyze", "record", "recommend"})
+    required_clear_checks: int = 2
+
+
+@dataclass
+class Worker:
+    worker_id: str
+    role: Role
+    trusted_image: bool
+    clean: bool
+    generation: int = 1
+    token: str | None = None
+
+
+@dataclass
+class Audit:
+    entries: list[dict[str, Any]] = field(default_factory=list)
+    head: str = "0" * 64
+
+    def append(self, event: str, details: dict[str, Any]) -> None:
+        entry = {"sequence": len(self.entries) + 1, "event": event, "details": details,
+                 "previous_hash": self.head}
+        raw = json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        self.head = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        entry["hash"] = self.head
+        self.entries.append(entry)
+
+    def verify(self) -> bool:
+        head = "0" * 64
+        for idx, recorded in enumerate(self.entries, start=1):
+            entry = {k: v for k, v in recorded.items() if k != "hash"}
+            if entry["sequence"] != idx or entry["previous_hash"] != head:
+                return False
+            raw = json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            head = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            if recorded["hash"] != head:
+                return False
+        return head == self.head
+
+
+class Axis:
+    """Deterministic simulator of a reference monitor and fail-closed transitions."""
+
+    def __init__(self, policy: Policy | None = None):
+        self.policy = policy or Policy()
+        self.mode = Mode.NORMAL
+        self.workers: dict[str, Worker] = {}
+        self._active_tokens: dict[str, tuple[str, Role, int]] = {}
+        self.audit = Audit()
+        self.virtual_count = 0
+        self.real_count = 0
+        self.clear_checks = 0
+        self.events: list[dict[str, str]] = []
+        self.audit.append("axis_initialized", {"policy_version": self.policy.version})
+
+    def _reject(self, reason: str) -> None:
+        self.audit.append("denied", {"reason": reason})
+        raise Denied(reason)
+
+    def _issue(self, worker: Worker) -> str:
+        # Deterministic simulation token, not a production credential.
+        token = f"sim:{worker.worker_id}:{worker.generation}:{worker.role.value}"
+        self._active_tokens[token] = (worker.worker_id, worker.role, worker.generation)
+        worker.token = token
+        return token
+
+    def register(self, worker_id: str, role: Role, *, trusted_image: bool, clean: bool) -> str:
+        if worker_id in self.workers or role == Role.NEUTRAL or not trusted_image or not clean:
+            self._reject("registration_requires_unique_trusted_clean_worker")
+        worker = Worker(worker_id, role, trusted_image, clean)
+        self.workers[worker_id] = worker
+        token = self._issue(worker)
+        self.audit.append("registered", {"worker": worker_id, "role": role.value})
+        return token
+
+    def _authorize(self, token: str, expected: Role) -> Worker:
+        record = self._active_tokens.get(token)
+        if record is None:
+            self._reject("invalid_or_revoked_capability")
+        worker_id, role, generation = record
+        worker = self.workers[worker_id]
+        if (worker.role != expected or role != expected or
+                worker.generation != generation or worker.token != token):
+            self._reject("capability_role_or_generation_mismatch")
+        return worker
+
+    def ingest_virtual(self, token: str, event: dict[str, Any]) -> bool:
+        """Accept an untrusted data *candidate*, never an executable instruction."""
+        self._authorize(token, Role.VIRTUAL)
+        if self.mode == Mode.ZERO_NEUTRAL:
+            self._reject("zero_neutral_no_ingestion")
+        if type(event) is not dict or set(event) != {"kind", "source", "description"}:
+            self._reject("invalid_event_schema")
+        if any(type(v) is not str for v in event.values()):
+            self._reject("event_values_must_be_strings")
+        if event["kind"] not in self.policy.permitted_event_kinds:
+            self._reject("event_kind_not_permitted")
+        if len(json.dumps(event, ensure_ascii=False).encode("utf-8")) > self.policy.max_event_bytes:
+            self._reject("event_too_large")
+        if self.virtual_count >= self.policy.virtual_event_limit:
+            self.mode = Mode.DEGRADED
+            self.audit.append("virtual_backpressure", {"accepted": False})
+            return False
+        self.virtual_count += 1
+        # Keep data distinct from commands: only schema-validated immutable-shaped values.
+        self.events.append({"kind": event["kind"], "source": event["source"],
+                            "description": event["description"]})
+        self.audit.append("candidate_received", {"kind": event["kind"]})
+        return True
+
+    def real_action(self, token: str, action: str, *, verified: bool) -> bool:
+        self._authorize(token, Role.REAL)
+        if action not in self.policy.permitted_real_actions:
+            self._reject("real_action_outside_hard_boundary")
+        if self.mode == Mode.ZERO_NEUTRAL:
+            self._reject("zero_neutral_no_real_actions")
+        if not verified:
+            self._reject("unverified_candidate_cannot_drive_action")
+        if self.real_count >= self.policy.real_job_limit:
+            self.mode = Mode.DEGRADED
+            self.audit.append("real_backpressure", {"accepted": False})
+            return False
+        self.real_count += 1
+        self.audit.append("real_action", {"action": action})
+        return True
+
+    def enter_zero_neutral(self, reason: str) -> None:
+        self.mode = Mode.ZERO_NEUTRAL
+        self.clear_checks = 0
+        self.audit.append("zero_neutral_entered", {"reason": reason})
+
+    def recover(self, *, independent_check: bool, human_approved: bool) -> bool:
+        if self.mode != Mode.ZERO_NEUTRAL:
+            self._reject("recovery_only_from_zero_neutral")
+        if not independent_check:
+            self.clear_checks = 0
+            self.audit.append("recovery_check_failed", {})
+            return False
+        self.clear_checks += 1
+        if self.clear_checks < self.policy.required_clear_checks or not human_approved:
+            self.audit.append("recovery_pending", {"checks": self.clear_checks})
+            return False
+        self.virtual_count = 0
+        self.real_count = 0
+        self.mode = Mode.NORMAL
+        self.audit.append("recovered", {"checks": self.clear_checks, "human_approved": True})
+        return True
+
+    def next_window(self) -> None:
+        """Start a new bounded measurement window; do not lift zero-neutral."""
+        self.virtual_count = 0
+        self.real_count = 0
+        if self.mode == Mode.DEGRADED:
+            self.mode = Mode.NORMAL
+        self.audit.append("window_reset", {"mode": self.mode.value})
+
+    def transition(self, token: str, new_role: Role, *, clean_rebuild: bool,
+                   independent_verified: bool, human_approved: bool) -> str:
+        """Revoke old role first; transition via neutral; fail closed on any failure."""
+        record = self._active_tokens.get(token)
+        if record is None:
+            self._reject("invalid_or_revoked_capability")
+        worker_id, prior_role, _ = record
+        worker = self._authorize(token, prior_role)
+        if new_role == Role.NEUTRAL or new_role == prior_role:
+            self._reject("invalid_target_role")
+        # Never promote an attacker-exposed worker directly into trusted real execution.
+        # An entirely new, trusted worker is required for virtual -> real.
+        if prior_role == Role.VIRTUAL and new_role == Role.REAL:
+            self._reject("virtual_worker_cannot_be_promoted_to_real")
+        del self._active_tokens[token]
+        worker.token = None
+        worker.role = Role.NEUTRAL
+        worker.generation += 1
+        self.audit.append("role_revoked_to_neutral", {"worker": worker_id})
+        if not (clean_rebuild and independent_verified and human_approved and worker.trusted_image and worker.clean):
+            self.audit.append("transition_held_in_neutral", {"worker": worker_id})
+            self._reject("transition_checks_failed")
+        worker.role = new_role
+        new_token = self._issue(worker)
+        self.audit.append("transition_completed", {"worker": worker_id, "role": new_role.value})
+        return new_token
+
+    def propose_policy_change(self, token: str, *_: Any, **__: Any) -> None:
+        if token not in self._active_tokens:
+            self._reject("invalid_or_revoked_capability")
+        self._reject("ai_cannot_modify_constitutional_policy")
+
+
+def demo() -> None:
+    axis = Axis()
+    virtual = axis.register("web-sensor", Role.VIRTUAL, trusted_image=True, clean=True)
+    real = axis.register("analyst", Role.REAL, trusted_image=True, clean=True)
+    for i in range(4):
+        ok = axis.ingest_virtual(virtual, {"kind": "probe", "source": "decoy",
+                                               "description": f"attempt-{i}"})
+        print(f"virtual event {i+1}: {'accepted' if ok else 'backpressure'}")
+    print("mode:", axis.mode.value)
+    print("real verified analysis:", axis.real_action(real, "analyze", verified=True))
+    axis.enter_zero_neutral("incident")
+    print("neutral:", axis.mode.value)
+    print("recovery check 1:", axis.recover(independent_check=True, human_approved=False))
+    print("recovery check 2 + approval:", axis.recover(independent_check=True, human_approved=True))
+    print("mode:", axis.mode.value)
+    print("audit chain valid:", axis.audit.verify(), "records:", len(axis.audit.entries))
+
+if __name__ == "__main__":
+    demo()
 
 
 if __name__ == "__main__":
