@@ -1508,252 +1508,335 @@ def main() -> None:
     print(
         f"records: {len(axis.audit.records)}"
     )
-    
-"""Virtual–Real Transition Axis v0.1. Standard library only.
-
-Simulation, NOT a production security boundary.
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass, field
-from enum import Enum
-import hashlib
-import json
-from typing import Any
 
 
-class Denied(Exception):
-    """A policy or state-transition request was rejected."""
+# VRTA v0.4 addition. Insert this block before the final __main__ guard
+# in the existing v0.3 axis.py. Keep all earlier classes and main().
+from copy import deepcopy
+from functools import wraps
+from threading import RLock
+
+from role_rotation import (
+    DomainCredential,
+    DomainRole,
+    RoleRotation,
+    RotationDenied,
+    RotationFailed,
+    RotationRequest,
+)
 
 
-class Role(str, Enum):
-    VIRTUAL = "virtual"
-    REAL = "real"
-    NEUTRAL = "neutral"
+def _v4_command(method):
+    """Serialize public commands and reject callback reentry."""
+    @wraps(method)
+    def run(self, *args, **kwargs):
+        with self._command_lock:
+            if self._in_command:
+                raise AuthorityError("axis command already in progress")
+            self._in_command = True
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                self._in_command = False
+    return run
 
 
-class Mode(str, Enum):
-    NORMAL = "normal"
-    DEGRADED = "degraded"
-    ZERO_NEUTRAL = "zero_neutral"
+class _RotationCoreV4(TransitionAxisV3):
+    """Private v0.3 engine with v0.4 credential checks."""
+
+    def _authorize(self, credential: DomainCredential, required: Role) -> None:
+        if self.mode == Mode.ZERO_NEUTRAL or not self._rotation.accepts(
+            credential, role=DomainRole(required.value), generation=self.generation
+        ):
+            raise AuthorityError("no current credential for the required role")
+
+    def _authorize_element(self, token: ElementToken) -> Element:
+        if (
+            not isinstance(token, ElementToken)
+            or type(token.token_id) is not str
+            or self._element_tokens.get(token.token_id) is not token
+        ):
+            raise AuthorityError("no registered element credential")
+        return super()._authorize_element(token)
 
 
-@dataclass(frozen=True)
-class Policy:
-    version: str = "0.1"
-    virtual_event_limit: int = 3
-    real_job_limit: int = 2
-    max_event_bytes: int = 1024
-    permitted_event_kinds: frozenset[str] = frozenset({"probe", "auth_failure", "anomaly"})
-    permitted_real_actions: frozenset[str] = frozenset({"analyze", "record", "recommend"})
-    required_clear_checks: int = 2
+class TransitionAxisV4:
+    """Experimental serialized facade. Older axis classes are separate APIs."""
 
+    def __init__(
+        self,
+        *,
+        trusted_sources: frozenset[str],
+        element_bindings: Mapping[str, Element],
+        administrator: object,
+        virtual_limit: int = 3,
+        feedback_config: FeedbackConfig | None = None,
+    ) -> None:
+        self._command_lock = RLock()
+        self._in_command = False
+        self._administrator = administrator
+        self._core = _RotationCoreV4(
+            trusted_sources=trusted_sources,
+            element_bindings=element_bindings,
+            administrator=administrator,
+            virtual_limit=virtual_limit,
+            feedback_config=feedback_config,
+        )
+        self._rotation = RoleRotation(
+            administrator=administrator,
+            audit_ready=self._probe_rotation_audit,
+            append_audit=self._append_confirmed,
+        )
+        self._core._rotation = self._rotation
+        self._neutral_audit_pending = False
+        self._rotation_reconciled = False
 
-@dataclass
-class Worker:
-    worker_id: str
-    role: Role
-    trusted_image: bool
-    clean: bool
-    generation: int = 1
-    token: str | None = None
+    @property
+    def mode(self) -> Mode:
+        with self._command_lock:
+            return self._core.mode
 
+    @property
+    def generation(self) -> int:
+        with self._command_lock:
+            return self._core.generation
 
-@dataclass
-class Audit:
-    entries: list[dict[str, Any]] = field(default_factory=list)
-    head: str = "0" * 64
+    @property
+    def degradation_causes(self) -> tuple[str, ...]:
+        with self._command_lock:
+            return self._core.degradation_causes
 
-    def append(self, event: str, details: dict[str, Any]) -> None:
-        entry = {"sequence": len(self.entries) + 1, "event": event, "details": details,
-                 "previous_hash": self.head}
-        raw = json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        self.head = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-        entry["hash"] = self.head
-        self.entries.append(entry)
+    @property
+    def audit_records(self) -> tuple[dict, ...]:
+        with self._command_lock:
+            return tuple(deepcopy(self._core.audit.records))
 
-    def verify(self) -> bool:
-        head = "0" * 64
-        for idx, recorded in enumerate(self.entries, start=1):
-            entry = {k: v for k, v in recorded.items() if k != "hash"}
-            if entry["sequence"] != idx or entry["previous_hash"] != head:
+    @_v4_command
+    def verify_audit(self) -> bool:
+        return self._core.audit.verify()
+
+    def _require_admin(self, administrator: object) -> None:
+        if administrator is not self._administrator:
+            raise AuthorityError("administrator capability required")
+
+    def _require_active(self) -> None:
+        if self._core.mode == Mode.ZERO_NEUTRAL:
+            raise AuthorityError("axis is neutralized")
+
+    def _append_confirmed(self, action: str, details: dict) -> None:
+        log = self._core.audit
+        index = len(log.records)
+        log.append(action, details)
+        if (
+            len(log.records) != index + 1
+            or log.records[index].get("action") != action
+            or log.records[index].get("details") != details
+            or log.verify() is not True
+        ):
+            raise OSError("audit append not confirmed")
+
+    def _probe_rotation_audit(self) -> bool:
+        if self._core.audit.verify() is not True:
+            return False
+        self._append_confirmed(
+            "rotation_audit_ready", {"generation": self._core.generation}
+        )
+        return True
+
+    def _best_effort_audit(self, action: str, details: dict) -> bool:
+        try:
+            self._append_confirmed(action, details)
+        except Exception:
+            return False
+        return True
+
+    @_v4_command
+    def issue_token(
+        self, token_id: str, role: Role, *, administrator: object = None
+    ) -> DomainCredential:
+        self._require_admin(administrator)
+        self._require_active()
+        if type(token_id) is not str or not isinstance(role, Role):
+            raise ValidationError("invalid credential ID or domain role")
+        if token_id in self._core._element_tokens:
+            raise AuthorityError("credential ID already used")
+        try:
+            return self._rotation.assign(
+                administrator=administrator, role=DomainRole(role.value),
+                token_id=token_id, generation=self._core.generation,
+            )
+        except RotationDenied as exc:
+            raise AuthorityError(str(exc)) from exc
+
+    @_v4_command
+    def issue_element_token(
+        self, token_id: str, *, administrator: object = None
+    ) -> ElementToken:
+        self._require_admin(administrator)
+        self._require_active()
+        if type(token_id) is not str:
+            raise ValidationError("invalid element credential ID")
+        if token_id in self._rotation._used_ids:
+            raise AuthorityError("credential ID already used")
+        return self._core.issue_element_token(token_id)
+
+    @_v4_command
+    def rotate_role(
+        self, request: RotationRequest, *, administrator: object
+    ) -> DomainCredential:
+        try:
+            self._require_admin(administrator)
+            self._require_active()
+            if (
+                type(request) is RotationRequest
+                and type(request.new_id) is str
+                and request.new_id in self._core._element_tokens
+            ):
+                raise AuthorityError("credential ID already used")
+            return self._rotation.rotate(
+                request, administrator=administrator,
+                generation=self._core.generation,
+            )
+        except RotationFailed:
+            self._enter_neutral("rotation_failed")
+            raise
+        except (RotationDenied, AuthorityError) as exc:
+            self._best_effort_audit(
+                "rotation_denied",
+                {"generation": self._core.generation, "reason": str(exc)},
+            )
+            if isinstance(exc, RotationDenied):
+                raise AuthorityError(str(exc)) from exc
+            raise
+
+    def _enter_neutral(self, reason: str) -> None:
+        # Safety state changes precede audit and do not call the legacy
+        # neutralize() path, which can stop partway through on an audit error.
+        core = self._core
+        core.mode = Mode.ZERO_NEUTRAL
+        core.generation += 1
+        core.virtual_load = 0
+        core._accepted_events.clear()
+        core._legacy_degraded = False
+        core._feedback_degraded = False
+        core._feedback_controller.reset()
+        self._rotation_reconciled = False
+        self._neutral_audit_pending = not self._best_effort_audit(
+            "axis_neutralized", {"generation": core.generation, "reason": reason}
+        )
+
+    @_v4_command
+    def neutralize(self, reason: str, *, administrator: object) -> None:
+        self._require_admin(administrator)
+        if type(reason) is not str or not reason.strip():
+            raise ValidationError("a nonblank neutralization reason is required")
+        self._enter_neutral(reason)
+
+    @_v4_command
+    def recover(
+        self, *, safety_verified: bool, human_approved: bool,
+        administrator: object = None,
+    ) -> bool:
+        self._require_admin(administrator)
+        core = self._core
+        if core.mode != Mode.ZERO_NEUTRAL:
+            return False
+        if safety_verified is not True or human_approved is not True:
+            self._best_effort_audit(
+                "recovery_denied", {"generation": core.generation}
+            )
+            return False
+
+        failure = self._rotation.failure
+        try:
+            if core.audit.verify() is not True:
                 return False
-            raw = json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            head = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-            if recorded["hash"] != head:
-                return False
-        return head == self.head
-
-
-class Axis:
-    """Deterministic simulator of a reference monitor and fail-closed transitions."""
-
-    def __init__(self, policy: Policy | None = None):
-        self.policy = policy or Policy()
-        self.mode = Mode.NORMAL
-        self.workers: dict[str, Worker] = {}
-        self._active_tokens: dict[str, tuple[str, Role, int]] = {}
-        self.audit = Audit()
-        self.virtual_count = 0
-        self.real_count = 0
-        self.clear_checks = 0
-        self.events: list[dict[str, str]] = []
-        self.audit.append("axis_initialized", {"policy_version": self.policy.version})
-
-    def _reject(self, reason: str) -> None:
-        self.audit.append("denied", {"reason": reason})
-        raise Denied(reason)
-
-    def _issue(self, worker: Worker) -> str:
-        # Deterministic simulation token, not a production credential.
-        token = f"sim:{worker.worker_id}:{worker.generation}:{worker.role.value}"
-        self._active_tokens[token] = (worker.worker_id, worker.role, worker.generation)
-        worker.token = token
-        return token
-
-    def register(self, worker_id: str, role: Role, *, trusted_image: bool, clean: bool) -> str:
-        if worker_id in self.workers or role == Role.NEUTRAL or not trusted_image or not clean:
-            self._reject("registration_requires_unique_trusted_clean_worker")
-        worker = Worker(worker_id, role, trusted_image, clean)
-        self.workers[worker_id] = worker
-        token = self._issue(worker)
-        self.audit.append("registered", {"worker": worker_id, "role": role.value})
-        return token
-
-    def _authorize(self, token: str, expected: Role) -> Worker:
-        record = self._active_tokens.get(token)
-        if record is None:
-            self._reject("invalid_or_revoked_capability")
-        worker_id, role, generation = record
-        worker = self.workers[worker_id]
-        if (worker.role != expected or role != expected or
-                worker.generation != generation or worker.token != token):
-            self._reject("capability_role_or_generation_mismatch")
-        return worker
-
-    def ingest_virtual(self, token: str, event: dict[str, Any]) -> bool:
-        """Accept an untrusted data *candidate*, never an executable instruction."""
-        self._authorize(token, Role.VIRTUAL)
-        if self.mode == Mode.ZERO_NEUTRAL:
-            self._reject("zero_neutral_no_ingestion")
-        if type(event) is not dict or set(event) != {"kind", "source", "description"}:
-            self._reject("invalid_event_schema")
-        if any(type(v) is not str for v in event.values()):
-            self._reject("event_values_must_be_strings")
-        if event["kind"] not in self.policy.permitted_event_kinds:
-            self._reject("event_kind_not_permitted")
-        if len(json.dumps(event, ensure_ascii=False).encode("utf-8")) > self.policy.max_event_bytes:
-            self._reject("event_too_large")
-        if self.virtual_count >= self.policy.virtual_event_limit:
-            self.mode = Mode.DEGRADED
-            self.audit.append("virtual_backpressure", {"accepted": False})
+            missing_rotation = failure is not None and not failure.failure_logged
+            if self._neutral_audit_pending or (
+                missing_rotation and not self._rotation_reconciled
+            ):
+                self._append_confirmed(
+                    "rotation_reconciled" if failure else "neutralization_reconciled",
+                    {
+                        "rotation_id": failure.rotation_id if failure else None,
+                        "failed_generation": failure.generation if failure else None,
+                        "generation": core.generation,
+                        "outcome": "not_committed" if failure else "neutralized",
+                    },
+                )
+                self._neutral_audit_pending = False
+                self._rotation_reconciled = failure is not None
+            self._append_confirmed(
+                "axis_recovery_approved", {"generation": core.generation}
+            )
+        except Exception:
             return False
-        self.virtual_count += 1
-        # Keep data distinct from commands: only schema-validated immutable-shaped values.
-        self.events.append({"kind": event["kind"], "source": event["source"],
-                            "description": event["description"]})
-        self.audit.append("candidate_received", {"kind": event["kind"]})
+
+        if failure is not None:
+            self._rotation.finish_axis_recovery(
+                administrator=administrator, generation=core.generation
+            )
+        core._feedback_controller.reset()
+        core.mode = Mode.NORMAL
         return True
 
-    def real_action(self, token: str, action: str, *, verified: bool) -> bool:
-        self._authorize(token, Role.REAL)
-        if action not in self.policy.permitted_real_actions:
-            self._reject("real_action_outside_hard_boundary")
-        if self.mode == Mode.ZERO_NEUTRAL:
-            self._reject("zero_neutral_no_real_actions")
-        if not verified:
-            self._reject("unverified_candidate_cannot_drive_action")
-        if self.real_count >= self.policy.real_job_limit:
-            self.mode = Mode.DEGRADED
-            self.audit.append("real_backpressure", {"accepted": False})
-            return False
-        self.real_count += 1
-        self.audit.append("real_action", {"action": action})
-        return True
+    @_v4_command
+    def receive_virtual(
+        self, token: DomainCredential, event: dict[str, Any]
+    ) -> str:
+        return self._core.receive_virtual(token, event)
 
-    def enter_zero_neutral(self, reason: str) -> None:
-        self.mode = Mode.ZERO_NEUTRAL
-        self.clear_checks = 0
-        self.audit.append("zero_neutral_entered", {"reason": reason})
+    @_v4_command
+    def verify_evidence(
+        self, evidence: Mapping[str, Any] | EvidenceRecord
+    ) -> VerificationReceipt:
+        return self._core.verify_evidence(evidence)
 
-    def recover(self, *, independent_check: bool, human_approved: bool) -> bool:
-        if self.mode != Mode.ZERO_NEUTRAL:
-            self._reject("recovery_only_from_zero_neutral")
-        if not independent_check:
-            self.clear_checks = 0
-            self.audit.append("recovery_check_failed", {})
-            return False
-        self.clear_checks += 1
-        if self.clear_checks < self.policy.required_clear_checks or not human_approved:
-            self.audit.append("recovery_pending", {"checks": self.clear_checks})
-            return False
-        self.virtual_count = 0
-        self.real_count = 0
-        self.mode = Mode.NORMAL
-        self.audit.append("recovered", {"checks": self.clear_checks, "human_approved": True})
-        return True
+    def execute_real(self, token: object, operation: str, *, verified: bool) -> bool:
+        raise AuthorityError("a registered evidence receipt is required")
 
-    def next_window(self) -> None:
-        """Start a new bounded measurement window; do not lift zero-neutral."""
-        self.virtual_count = 0
-        self.real_count = 0
-        if self.mode == Mode.DEGRADED:
-            self.mode = Mode.NORMAL
-        self.audit.append("window_reset", {"mode": self.mode.value})
+    @_v4_command
+    def execute_real_verified(
+        self, token: DomainCredential, operation: str, *, receipt_id: str,
+        evidence_id: str | None = None, event_id: str | None = None,
+    ) -> bool:
+        if type(operation) is not str:
+            raise ValidationError("operation must be a string")
+        return self._core.execute_real_verified(
+            token, operation, receipt_id=receipt_id,
+            evidence_id=evidence_id, event_id=event_id,
+        )
 
-    def transition(self, token: str, new_role: Role, *, clean_rebuild: bool,
-                   independent_verified: bool, human_approved: bool) -> str:
-        """Revoke old role first; transition via neutral; fail closed on any failure."""
-        record = self._active_tokens.get(token)
-        if record is None:
-            self._reject("invalid_or_revoked_capability")
-        worker_id, prior_role, _ = record
-        worker = self._authorize(token, prior_role)
-        if new_role == Role.NEUTRAL or new_role == prior_role:
-            self._reject("invalid_target_role")
-        # Never promote an attacker-exposed worker directly into trusted real execution.
-        # An entirely new, trusted worker is required for virtual -> real.
-        if prior_role == Role.VIRTUAL and new_role == Role.REAL:
-            self._reject("virtual_worker_cannot_be_promoted_to_real")
-        del self._active_tokens[token]
-        worker.token = None
-        worker.role = Role.NEUTRAL
-        worker.generation += 1
-        self.audit.append("role_revoked_to_neutral", {"worker": worker_id})
-        if not (clean_rebuild and independent_verified and human_approved and worker.trusted_image and worker.clean):
-            self.audit.append("transition_held_in_neutral", {"worker": worker_id})
-            self._reject("transition_checks_failed")
-        worker.role = new_role
-        new_token = self._issue(worker)
-        self.audit.append("transition_completed", {"worker": worker_id, "role": new_role.value})
-        return new_token
+    @_v4_command
+    def request_restriction(
+        self, token: ElementToken, request: Mapping[str, Any] | RestrictionRequest
+    ) -> RestrictionDecision:
+        return self._core.request_restriction(token, request)
 
-    def propose_policy_change(self, token: str, *_: Any, **__: Any) -> None:
-        if token not in self._active_tokens:
-            self._reject("invalid_or_revoked_capability")
-        self._reject("ai_cannot_modify_constitutional_policy")
+    @_v4_command
+    def release_restriction(
+        self, *, administrator: object, action: RestrictionAction
+    ) -> bool:
+        return self._core.release_restriction(administrator=administrator, action=action)
 
+    @_v4_command
+    def restriction_active(self, action: RestrictionAction) -> bool:
+        return self._core.restriction_active(action)
 
-def demo() -> None:
-    axis = Axis()
-    virtual = axis.register("web-sensor", Role.VIRTUAL, trusted_image=True, clean=True)
-    real = axis.register("analyst", Role.REAL, trusted_image=True, clean=True)
-    for i in range(4):
-        ok = axis.ingest_virtual(virtual, {"kind": "probe", "source": "decoy",
-                                               "description": f"attempt-{i}"})
-        print(f"virtual event {i+1}: {'accepted' if ok else 'backpressure'}")
-    print("mode:", axis.mode.value)
-    print("real verified analysis:", axis.real_action(real, "analyze", verified=True))
-    axis.enter_zero_neutral("incident")
-    print("neutral:", axis.mode.value)
-    print("recovery check 1:", axis.recover(independent_check=True, human_approved=False))
-    print("recovery check 2 + approval:", axis.recover(independent_check=True, human_approved=True))
-    print("mode:", axis.mode.value)
-    print("audit chain valid:", axis.audit.verify(), "records:", len(axis.audit.entries))
+    @_v4_command
+    def observe_load(
+        self, observation: Mapping[str, Any] | LoadObservation
+    ) -> FeedbackDecision:
+        return self._core.observe_load(observation)
 
-if __name__ == "__main__":
-    demo()
+    @_v4_command
+    def feedback_snapshot(self) -> dict[str, Any]:
+        return self._core.feedback_snapshot()
+
+    @_v4_command
+    def reset_virtual_load(self, *, administrator: object) -> None:
+        self._require_admin(administrator)
+        self._core.reset_virtual_load()
 
 
 if __name__ == "__main__":
