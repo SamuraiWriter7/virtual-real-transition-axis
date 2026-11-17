@@ -1,4 +1,4 @@
-"""Virtual-Real Transition Axis v0.3.
+"""Virtual-Real Transition Axis v0.5.
 
 Python 3.11+.
 Standard library only.
@@ -7,6 +7,8 @@ Versions:
 - TransitionAxis: v0.1 legacy reference
 - TransitionAxisV2: evidence and five-element control
 - TransitionAxisV3: seesaw negative feedback integration
+- TransitionAxisV4: role rotation
+- TransitionAxisV5: restart recovery with local checkpoints
 
 Experimental behavioral prototype.
 Not a production security boundary.
@@ -16,9 +18,15 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Mapping
+from uuid import uuid4
+
+from checkpoint import (
+    Checkpoint, CheckpointConflict, CheckpointError, CheckpointInvalid,
+    CheckpointMissing, CheckpointStore, PendingOperation,
+)
 
 from evidence import (
     EvidenceError,
@@ -1837,6 +1845,429 @@ class TransitionAxisV4:
     def reset_virtual_load(self, *, administrator: object) -> None:
         self._require_admin(administrator)
         self._core.reset_virtual_load()
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryContext:
+    """Non-authorizing context for the two simulated recovery decisions."""
+
+    startup_id: str
+    generation: int
+    revision: int
+
+
+class TransitionAxisV5:
+    """VRTA restart-aware facade for one trusted axis and checkpoint writer.
+
+    No v0.4 object is exposed through this API. All public operations share
+    the same command boundary, including checkpoint readback and publication.
+    """
+
+    def __init__(
+        self,
+        *,
+        checkpoint: CheckpointStore,
+        trusted_sources: frozenset[str],
+        element_bindings: Mapping[str, Element],
+        administrator: object,
+        virtual_limit: int = 3,
+        feedback_config: FeedbackConfig | None = None,
+    ) -> None:
+        self._command_lock = RLock()
+        self._in_command = False
+        self._startup_id = uuid4().hex
+        self._store = checkpoint
+        self._axis = TransitionAxisV4(
+            trusted_sources=trusted_sources,
+            element_bindings=element_bindings,
+            administrator=administrator,
+            virtual_limit=virtual_limit,
+            feedback_config=feedback_config,
+        )
+        self._core = self._axis._core
+        self._core.mode = Mode.ZERO_NEUTRAL
+        self._checkpoint: Checkpoint | None = None
+        self._checkpoint_error: str | None = None
+        try:
+            self._adopt(self._store.load())
+        except CheckpointError as exc:
+            self._checkpoint_error = type(exc).__name__
+
+    @property
+    def startup_id(self) -> str:
+        return self._startup_id
+
+    @property
+    def mode(self) -> Mode:
+        with self._command_lock:
+            return self._axis.mode
+
+    @property
+    def generation(self) -> int:
+        with self._command_lock:
+            return self._axis.generation
+
+    @property
+    def degradation_causes(self) -> tuple[str, ...]:
+        with self._command_lock:
+            return self._axis.degradation_causes
+
+    @property
+    def audit_records(self) -> tuple[dict, ...]:
+        with self._command_lock:
+            return self._axis.audit_records
+
+    @property
+    def checkpoint_issue(self) -> str | None:
+        with self._command_lock:
+            return self._checkpoint_error
+
+    @property
+    def checkpoint(self) -> Checkpoint | None:
+        """Diagnostic snapshot. Pending records expose only confirmed restrictions."""
+        with self._command_lock:
+            return self._checkpoint
+
+    def _adopt(self, record: Checkpoint) -> None:
+        self._core._active_restrictions = {
+            RestrictionAction(value) for value in record.restrictions
+        }
+        self._checkpoint = record
+        self._checkpoint_error = None
+
+    def _require_neutral_admin(self, administrator: object) -> None:
+        self._axis._require_admin(administrator)
+        if self._core.mode != Mode.ZERO_NEUTRAL:
+            raise AuthorityError("checkpoint recovery requires neutral mode")
+
+    def _confirm_audit(self, action: str, details: dict[str, Any]) -> str:
+        self._axis._append_confirmed(action, {
+            **details,
+            "startup_id": self._startup_id,
+            "generation": self._core.generation,
+        })
+        return self._core.audit.records[-1]["hash"]
+
+    @staticmethod
+    def _required_text(value: str) -> None:
+        if type(value) is not str or not value.strip():
+            raise ValidationError("a nonblank string is required")
+
+    @_v4_command
+    def provision_checkpoint(
+        self, *, administrator: object, restrictions: frozenset[str],
+    ) -> Checkpoint:
+        """Explicit commissioning for a new store, never a restart fallback."""
+        self._require_neutral_admin(administrator)
+        if self._checkpoint is not None or self._checkpoint_error != "CheckpointMissing":
+            raise AuthorityError("provisioning requires an uninitialized store")
+        confirmed = self._store.provision(restrictions=restrictions)
+        self._adopt(confirmed)
+        return confirmed
+
+    @_v4_command
+    def reconcile_checkpoint(
+        self, *, administrator: object, reason: str,
+    ) -> Checkpoint:
+        """Resolve a pending operation without performing it or opening the axis."""
+        self._require_neutral_admin(administrator)
+        self._required_text(reason)
+        pending = self._store.load()
+        operation = pending.pending
+        if operation is None:
+            raise AuthorityError("no pending operation to reconcile")
+
+        restrictions = pending.restrictions
+        if operation.kind == "activate_restriction":
+            restrictions = restrictions | {operation.target}
+        audit_ref = self._confirm_audit("checkpoint_reconciliation", {
+            "reason": reason,
+            "revision": pending.revision,
+            "operation_id": operation.operation_id,
+            "operation_kind": operation.kind,
+            "target": operation.target,
+            "outcome": "abandoned" if operation.kind == "rotate_role" else "conservative",
+            "restrictions": sorted(restrictions),
+        })
+        resolved = self._store.reconcile(pending, audit_ref=audit_ref)
+        self._adopt(resolved)
+        return resolved
+
+    @_v4_command
+    def rebuild_checkpoint(
+        self,
+        *,
+        administrator: object,
+        restrictions: frozenset[str],
+        baseline_ref: str,
+        reason: str,
+        revision_floor: int = -1,
+    ) -> Checkpoint:
+        """Publish a reviewed baseline when the store is missing or corrupt."""
+        self._require_neutral_admin(administrator)
+        self._required_text(reason)
+        self._required_text(baseline_ref)
+        if type(revision_floor) is not int or revision_floor < -1:
+            raise ValidationError("invalid revision floor")
+        if self._checkpoint is not None:
+            revision_floor = max(revision_floor, self._checkpoint.revision)
+        reviewed = Checkpoint(self._store.store_id, revision_floor + 1, restrictions)
+        try:
+            self._store.load()
+        except (CheckpointMissing, CheckpointInvalid) as exc:
+            issue = type(exc).__name__
+        else:
+            raise CheckpointConflict("a readable checkpoint must not be overwritten")
+        known = self._checkpoint
+        if known is not None:
+            protected = known.restrictions
+            if known.pending is not None and known.pending.kind == "activate_restriction":
+                protected = protected | {known.pending.target}
+            if not protected <= reviewed.restrictions:
+                raise AuthorityError("reviewed baseline omits a known restriction")
+        audit_ref = self._confirm_audit("checkpoint_baseline_reviewed", {
+            "reason": reason,
+            "baseline_ref": baseline_ref,
+            "condition": issue,
+            "revision": reviewed.revision,
+            "restrictions": sorted(reviewed.restrictions),
+        })
+        confirmed = self._store.rebuild(
+            restrictions=restrictions, audit_ref=audit_ref, revision_floor=revision_floor,
+        )
+        self._adopt(confirmed)
+        return confirmed
+
+    def recovery_context(self) -> RecoveryContext | None:
+        with self._command_lock:
+            known = self._checkpoint
+            if (
+                self._core.mode != Mode.ZERO_NEUTRAL
+                or known is None
+                or known.pending is not None
+                or self._checkpoint_error is not None
+            ):
+                return None
+            return RecoveryContext(self._startup_id, self._core.generation, known.revision)
+
+    @_v4_command
+    def recover(
+        self, *, administrator: object, context: RecoveryContext,
+        safety_verified: bool, human_approved: bool,
+    ) -> bool:
+        self._axis._require_admin(administrator)
+        expected = self.recovery_context()
+        if (
+            expected is None
+            or type(context) is not RecoveryContext
+            or context != expected
+            or safety_verified is not True
+            or human_approved is not True
+        ):
+            return False
+        try:
+            if self._store.load() != self._checkpoint:
+                return False
+            self._confirm_audit("checkpoint_recovery_approved", {
+                "revision": context.revision,
+                "safety_verified": True,
+                "human_approved": True,
+            })
+        except Exception:
+            # A storage or audit failure cannot grant recovery.
+            return False
+        return self._axis.recover(
+            administrator=administrator, safety_verified=True, human_approved=True,
+        )
+
+    def _halt(self, problem: Exception, known: Checkpoint | None) -> None:
+        # Neutralize before touching the checkpoint or relying on audit.
+        if self._core.mode != Mode.ZERO_NEUTRAL:
+            self._axis._enter_neutral("checkpoint_transaction_failed")
+        if known is not None:
+            self._adopt(known)
+        self._checkpoint_error = type(problem).__name__
+
+    def _begin_checkpoint(self, operation: PendingOperation) -> Checkpoint:
+        clean = self._checkpoint
+        if clean is None or clean.pending is not None:
+            error = CheckpointConflict("no confirmed clean checkpoint")
+            self._halt(error, clean)
+            raise error
+        try:
+            pending = self._store.begin(clean, operation)
+        except CheckpointError as exc:
+            # A failure before replacement can leave the old state confirmed.
+            try:
+                unchanged = self._store.load() == clean
+            except CheckpointError:
+                unchanged = False
+            if not unchanged:
+                self._halt(exc, clean)
+            raise
+        self._checkpoint = pending
+        return pending
+
+    def _finish_checkpoint(self, pending: Checkpoint) -> None:
+        try:
+            self._adopt(self._store.commit(pending))
+        except Exception as exc:
+            self._halt(exc, pending)
+            raise
+
+    @_v4_command
+    def rotate_role(
+        self, request: RotationRequest, *, administrator: object,
+    ) -> DomainCredential:
+        self._axis._require_admin(administrator)
+        self._axis._require_active()
+        rotation = self._axis._rotation
+        audit_ready = rotation._audit_ready
+        pending: Checkpoint | None = None
+        write_failure: CheckpointError | None = None
+
+        def prepare_cutover() -> bool:
+            # v0.4 invokes this after preflight and before closing the role gate.
+            nonlocal pending, write_failure
+            if audit_ready() is not True:
+                return False
+            try:
+                pending = self._begin_checkpoint(PendingOperation(
+                    request.rotation_id, "rotate_role", request.role.value,
+                ))
+            except CheckpointError as exc:
+                write_failure = exc
+                return False
+            return True
+
+        rotation._audit_ready = prepare_cutover
+        try:
+            new = self._axis.rotate_role(request, administrator=administrator)
+        except Exception as exc:
+            if pending is not None:
+                self._halt(exc, pending)
+            if write_failure is not None:
+                raise write_failure from exc
+            raise
+        finally:
+            rotation._audit_ready = audit_ready
+
+        if pending is None:
+            error = CheckpointConflict("rotation returned without a pending checkpoint")
+            self._halt(error, self._checkpoint)
+            raise error
+        self._finish_checkpoint(pending)
+        return new
+
+    @_v4_command
+    def request_restriction(
+        self, token: ElementToken, request: Mapping[str, Any] | RestrictionRequest,
+    ) -> RestrictionDecision:
+        self._axis._require_active()
+        source = self._core._authorize_element(token)
+        data = request.to_dict() if isinstance(request, RestrictionRequest) else request
+        parsed = RestrictionRequest.from_mapping(data)
+        decision = FiveElementMatrix.validate(parsed)
+        if source != parsed.source_element:
+            raise AuthorityError("source element does not match authority")
+        if parsed.request_id in self._core._used_request_ids:
+            raise AuthorityError("duplicate restriction request")
+        if not decision.restrictive:
+            return self._axis.request_restriction(token, parsed)
+        pending = self._begin_checkpoint(PendingOperation(
+            parsed.request_id, "activate_restriction", decision.action.value,
+        ))
+        try:
+            result = self._axis.request_restriction(token, parsed)
+        except Exception as exc:
+            self._halt(exc, pending)
+            raise
+        self._finish_checkpoint(pending)
+        return result
+
+    @_v4_command
+    def release_restriction(
+        self, *, administrator: object, action: RestrictionAction,
+    ) -> bool:
+        self._axis._require_admin(administrator)
+        self._axis._require_active()
+        if not isinstance(action, RestrictionAction):
+            raise ValidationError("invalid restriction action")
+        if not self._axis.restriction_active(action):
+            return False
+        pending = self._begin_checkpoint(PendingOperation(
+            uuid4().hex, "release_restriction", action.value,
+        ))
+        try:
+            if not self._axis.release_restriction(administrator=administrator, action=action):
+                raise CheckpointConflict("restriction release was not applied")
+        except Exception as exc:
+            self._halt(exc, pending)
+            raise
+        self._finish_checkpoint(pending)
+        return True
+
+    @_v4_command
+    def issue_token(
+        self, token_id: str, role: Role, *, administrator: object = None,
+    ) -> DomainCredential:
+        return self._axis.issue_token(token_id, role, administrator=administrator)
+
+    @_v4_command
+    def issue_element_token(
+        self, token_id: str, *, administrator: object = None,
+    ) -> ElementToken:
+        return self._axis.issue_element_token(token_id, administrator=administrator)
+
+    @_v4_command
+    def receive_virtual(self, token: DomainCredential, event: dict[str, Any]) -> str:
+        return self._axis.receive_virtual(token, event)
+
+    @_v4_command
+    def verify_evidence(
+        self, evidence: Mapping[str, Any] | EvidenceRecord,
+    ) -> VerificationReceipt:
+        receipt = self._axis.verify_evidence(evidence)
+        return replace(receipt, receipt_id=f"{self._startup_id}:{receipt.receipt_id}")
+
+    @_v4_command
+    def execute_real_verified(
+        self, token: DomainCredential, operation: str, *, receipt_id: str,
+        evidence_id: str | None = None, event_id: str | None = None,
+    ) -> bool:
+        prefix = f"{self._startup_id}:"
+        if type(receipt_id) is not str or not receipt_id.startswith(prefix):
+            raise AuthorityError("a receipt from the current startup is required")
+        return self._axis.execute_real_verified(
+            token, operation, receipt_id=receipt_id[len(prefix):],
+            evidence_id=evidence_id, event_id=event_id,
+        )
+
+    @_v4_command
+    def neutralize(self, reason: str, *, administrator: object) -> None:
+        self._axis.neutralize(reason, administrator=administrator)
+
+    @_v4_command
+    def restriction_active(self, action: RestrictionAction) -> bool:
+        return self._axis.restriction_active(action)
+
+    @_v4_command
+    def observe_load(
+        self, observation: Mapping[str, Any] | LoadObservation,
+    ) -> FeedbackDecision:
+        return self._axis.observe_load(observation)
+
+    @_v4_command
+    def feedback_snapshot(self) -> dict[str, Any]:
+        return self._axis.feedback_snapshot()
+
+    @_v4_command
+    def reset_virtual_load(self, *, administrator: object) -> None:
+        self._axis.reset_virtual_load(administrator=administrator)
+
+    @_v4_command
+    def verify_audit(self) -> bool:
+        return self._axis.verify_audit()
 
 
 if __name__ == "__main__":
