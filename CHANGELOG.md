@@ -14,14 +14,31 @@ where applicable.
 
 ## [Unreleased]
 
-### Planned
+---
 
-- Independent evidence verification and trusted receipts.
-- Five-element mutual restriction authority matrix.
-- Stronger authority credential validation.
-- Explicit verification and authorization separation.
+## [0.5.0] - 2026-11-17
 
-These features are not included in v0.1.0.
+### Added
+
+- Added `checkpoint.py` for a single local checkpoint store. It reads versioned records, checks store identity and integrity, and confirms writes by reading them back.
+- Added `TransitionAxisV5` with fail-closed restart recovery. Every startup begins in `zero_neutral`. Confirmed restrictions are restored, but domain credentials, five-element tokens, evidence receipts, and approvals are not.
+- Added administrator-led reconciliation for interrupted operations and an explicit rebuild path for missing or corrupt checkpoints. An interrupted handover is abandoned. A pending restriction activation is retained, and a pending release does not remove the restriction.
+
+### Changed
+
+- Role handovers and restriction changes now confirm a `pending` checkpoint before applying changes. An unconfirmed final write does not return success, publish a replacement credential, or lift a live restriction.
+- Recovery requires fresh simulated safety verification and human approval for the current startup and checkpoint revision. Reconciliation alone does not exit neutral mode. New credentials must be issued explicitly, and evidence must be verified again.
+- Preserved the v0.1–v0.4 APIs for regression and comparison.
+
+### Validation
+
+- GitHub Actions validation passed with 143 tests per configured Python version (3.11, 3.12, and 3.13): 118 baseline tests, 14 checkpoint tests, and 11 restart-recovery tests.
+- The restart suite exits a child process immediately after outgoing credential revocation. A fresh process reopens the same checkpoint and confirms that the pending handover is not resumed and that recovery remains blocked until reconciliation.
+- Kept the existing simulation checks and v0.3 integration smoke test.
+
+### Scope
+
+- Validation covers single-process stop and restart with a single writer and local storage. It does not establish power-loss durability, distributed recovery, protection against deliberate checkpoint tampering or rollback, or authenticated human approval.
 
 ---
 
